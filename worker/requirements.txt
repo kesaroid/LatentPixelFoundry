@@ -1,7 +1,27 @@
+# =============================================================================
+# GPU Worker Dependencies
+# =============================================================================
+# NOTE: This runs on x86_64 CUDA cloud instances, NOT on ARM / Apple Silicon.
+# For PyTorch CUDA builds, the cloud instance pip will resolve the correct wheel.
+# =============================================================================
+
+# --- Web framework ---
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
+
+# --- HTTP client (backend callbacks) ---
 httpx>=0.28.0
+
+# --- Configuration ---
 pydantic>=2.10.0
+pydantic-settings>=2.7.0
+
+# --- ML / Video generation ---
 torch>=2.1.0
 diffusers>=0.31.0
 accelerate>=1.2.0
+transformers>=4.47.0
+sentencepiece>=0.2.0
+
+# --- Video export ---
+imageio[ffmpeg]>=2.36.0
