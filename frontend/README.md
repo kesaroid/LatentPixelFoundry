@@ -1,15 +1,18 @@
 # Frontend -- Video Generation Dashboard
 
-A minimal Next.js dashboard for submitting video generation prompts, tracking job progress, and downloading completed videos.
+A dark-themed Next.js dashboard for submitting video generation prompts, tracking job progress in real time, and downloading completed videos.
+
+**Status: V1 implementation complete.** All components, API integration, polling, and styling are in place.
 
 ---
 
 ## Tech Stack
 
-- **Next.js 14** -- App Router
-- **React 18** -- UI components
-- **Tailwind CSS** -- Utility-first styling
-- **TypeScript** -- Type safety
+- **Next.js 16** -- App Router, React Server Components
+- **React 19** -- Client components where needed
+- **Tailwind CSS 4** -- Utility-first styling (dark theme)
+- **TypeScript 5** -- Full type safety
+- **Geist font** -- Clean, modern typography (via `next/font/google`)
 
 ---
 
@@ -17,69 +20,91 @@ A minimal Next.js dashboard for submitting video generation prompts, tracking jo
 
 ```
 frontend/
-  app/
-    layout.tsx               <-- Root layout, fonts, metadata
-    page.tsx                 <-- Main dashboard page
-  components/
-    JobForm.tsx              <-- Prompt input + submit button
-    JobList.tsx              <-- Fetches and displays all jobs, polls every 5s
-    JobCard.tsx              <-- Single job: status badge, download button
+  src/
+    app/
+      layout.tsx             -- Root layout: Geist fonts, dark mode, metadata
+      page.tsx               -- Main page: header, PromptForm, JobList
+      globals.css            -- Tailwind import, CSS custom properties
+    components/
+      PromptForm.tsx         -- Prompt textarea, duration input, resolution select, submit
+      JobList.tsx            -- Renders job cards, loading skeletons, empty state, error
+      JobCard.tsx            -- Single job: status badge, prompt, meta, error, download
+      StatusBadge.tsx        -- Color-coded pill per JobStatus with pulse animation
+    hooks/
+      useJobs.ts             -- 5-second polling hook: fetchJobs, loading, error, refetch
+    lib/
+      api.ts                 -- Typed HTTP client: createJob, fetchJobs, fetchJob, getDownloadUrl
+      types.ts               -- TypeScript types mirroring backend schemas: Job, JobCreate, JobStatus
+  .env.local.example         -- NEXT_PUBLIC_API_URL template
+  .gitignore
   package.json
-  tailwind.config.ts
   tsconfig.json
-  Dockerfile
+  next.config.ts
+  eslint.config.mjs
+  postcss.config.mjs
 ```
+
+**Note:** The implementation uses the `src/` directory convention (standard for Next.js) rather than the flat `app/` layout from the original plan. The prompt form component is named `PromptForm.tsx` rather than `JobForm.tsx`.
 
 ---
 
 ## Features
 
-### Prompt Submission
-- Text input for the video prompt
-- Optional duration selector (1-30 seconds, default 5)
-- Optional resolution selector (720p, 1080p)
-- Submit calls `POST /api/jobs` on the backend
+### Prompt Submission (`PromptForm.tsx`)
+- Multi-line textarea with 2000-character limit and live counter
+- Duration input (1-30 seconds, default 5)
+- Resolution dropdown (720p, 1080p)
+- Submit button with loading state ("Creating Job...")
+- Inline error display on failure
+- Form resets on successful submission
+- Calls `POST /api/jobs` via the typed API client
 
-### Job List
+### Job List (`JobList.tsx`)
 - Displays all jobs sorted newest-first
-- Polls `GET /api/jobs` every 5 seconds for live status updates
-- No WebSocket needed in V1 -- simple polling
+- Three states:
+  - **Loading:** Animated skeleton placeholders (3 pulse cards)
+  - **Error:** Red-tinted error message
+  - **Empty:** "No jobs yet" prompt
+- Each job rendered as a `JobCard`
 
-### Status Badges
-Each job shows a color-coded status badge:
+### Job Card (`JobCard.tsx`)
+- Status badge (via `StatusBadge`)
+- Relative timestamp ("2m ago", "1h ago")
+- Prompt text (2-line clamp)
+- Meta row: duration, resolution, generation time (if available)
+- Error message display for FAILED jobs (red background)
+- Download button for COMPLETED jobs (green, with download icon SVG)
+- Download links to `GET /api/jobs/{id}/download`
 
-| Status     | Color  |
-|------------|--------|
-| PENDING    | Gray   |
-| TRIGGERED  | Blue   |
-| GENERATING | Yellow |
-| UPLOADING  | Orange |
-| COMPLETED  | Green  |
-| FAILED     | Red    |
+### Status Badges (`StatusBadge.tsx`)
+Color-coded pill badges with Tailwind classes:
 
-### Video Download
-- COMPLETED jobs show a download button
-- Button links to `GET /api/jobs/{id}/download`
-- Browser handles the MP4 download natively
+| Status     | Color       | Extra           |
+|------------|-------------|-----------------|
+| PENDING    | Zinc/Gray   |                 |
+| TRIGGERED  | Blue        |                 |
+| GENERATING | Amber       | `animate-pulse` |
+| UPLOADING  | Indigo      |                 |
+| COMPLETED  | Emerald     |                 |
+| FAILED     | Red         |                 |
 
-### Error Display
-- FAILED jobs show the error message from the backend
-- Form validation for empty prompts
+### Polling (`useJobs.ts` hook)
+- Initial fetch on mount
+- Polls `GET /api/jobs` every 5 seconds via `setInterval`
+- Exposes: `jobs`, `loading`, `error`, `refetch()`
+- `refetch()` is called immediately after job creation for instant feedback
+- Interval is cleaned up on unmount
 
----
+### API Client (`lib/api.ts`)
+- Reads `NEXT_PUBLIC_API_URL` from environment (default: `http://localhost:8000`)
+- Generic `request<T>()` helper with error handling
+- Custom `ApiError` class with status code
+- Exported functions: `createJob()`, `fetchJobs()`, `fetchJob()`, `getDownloadUrl()`
 
-## API Integration
-
-The frontend communicates with the backend at `NEXT_PUBLIC_API_URL` (default: `http://localhost:8000`).
-
-| Action         | Method | Endpoint               |
-|----------------|--------|------------------------|
-| Create job     | POST   | `/api/jobs`            |
-| List jobs      | GET    | `/api/jobs`            |
-| Get job detail | GET    | `/api/jobs/{id}`       |
-| Download video | GET    | `/api/jobs/{id}/download` |
-
-See [CONTRACTS.md](../CONTRACTS.md) for full request/response shapes.
+### Type Definitions (`lib/types.ts`)
+- `JobStatus` enum mirroring backend's `JobStatus`
+- `JobCreate` interface (prompt, duration, resolution)
+- `Job` interface (full response shape matching `JobRead`)
 
 ---
 
@@ -89,7 +114,7 @@ See [CONTRACTS.md](../CONTRACTS.md) for full request/response shapes.
 |-----------------------|--------------------------|----------------------------|
 | `NEXT_PUBLIC_API_URL` | `http://localhost:8000`  | Backend API base URL       |
 
-Set in `.env.local` or as an environment variable.
+Set in `.env.local` (copy from `.env.local.example`).
 
 ---
 
@@ -99,35 +124,45 @@ Set in `.env.local` or as an environment variable.
 
 ```bash
 cd frontend
+cp .env.local.example .env.local  # optional, defaults work for local dev
 npm install
 npm run dev
 ```
 
-Dashboard at `http://localhost:3000`. Requires the backend to be running at `http://localhost:8000`.
+Dashboard at `http://localhost:3000`. Requires the backend running at `http://localhost:8000`.
 
-### Running in Docker (optional)
+### Build
 
-The Dockerfile is provided for consistency but during local development it's simpler to run `npm run dev` natively.
+```bash
+npm run build
+npm start         # production server on port 3000
+```
 
 ---
 
-## Design Principles
+## Design Choices
 
-- **Minimal UI.** No unnecessary chrome. Focus on the core flow: submit prompt, watch status, download video.
-- **No client-side state management library.** React state + polling is sufficient for V1.
+- **Dark theme only.** CSS custom properties set `--background: #09090b` and `--foreground: #fafafa`. The `<html>` element gets `class="dark"`.
+- **No state management library.** React `useState` + the `useJobs` polling hook cover everything needed for V1.
 - **No authentication.** V1 is a single-user local tool.
-- **Responsive.** Works on desktop. Mobile is not a priority but Tailwind keeps it reasonable.
+- **No WebSocket.** Simple 5-second polling is sufficient for the update frequency.
+- **Minimal dependencies.** Only Next.js, React, and Tailwind. No UI component library.
 
 ---
 
 ## Implementation Checklist
 
-- [ ] `layout.tsx` -- Root layout with Tailwind, metadata, font
-- [ ] `page.tsx` -- Main page composing JobForm + JobList
-- [ ] `JobForm.tsx` -- Prompt input, duration/resolution selectors, submit handler
-- [ ] `JobList.tsx` -- Fetch jobs, 5-second polling interval, render JobCards
-- [ ] `JobCard.tsx` -- Status badge, prompt text, timestamps, download button
-- [ ] `package.json` -- Dependencies (next, react, tailwind)
-- [ ] `tailwind.config.ts` + `globals.css` -- Tailwind setup
-- [ ] `Dockerfile` -- node:20-alpine multi-stage build
-- [ ] Error handling for failed API calls (toast or inline message)
+- [x] `layout.tsx` -- Root layout with Tailwind, Geist fonts, dark mode, metadata
+- [x] `page.tsx` -- Main page composing PromptForm + JobList
+- [x] `PromptForm.tsx` -- Prompt textarea, duration/resolution, submit with loading/error
+- [x] `JobList.tsx` -- Loading skeletons, error state, empty state, job cards
+- [x] `JobCard.tsx` -- Status badge, prompt, timestamps, meta row, error, download
+- [x] `StatusBadge.tsx` -- Color-coded pills with pulse animation for GENERATING
+- [x] `useJobs.ts` -- 5-second polling hook with refetch
+- [x] `api.ts` -- Typed API client with error handling
+- [x] `types.ts` -- TypeScript types mirroring backend schemas
+- [x] `globals.css` -- Tailwind + CSS custom properties
+- [x] `package.json` -- Next.js 16, React 19, Tailwind 4
+- [x] `.env.local.example` -- API URL template
+- [ ] Dockerfile -- Not yet created (run natively via `npm run dev` for now)
+- [ ] Toast/notification for successful job creation (currently just clears form)
