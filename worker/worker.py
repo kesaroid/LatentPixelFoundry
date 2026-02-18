@@ -41,7 +41,8 @@ def _setup_logging() -> None:
     )
     # Silence noisy libraries
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-    logging.getLogger("diffusers").setLevel(logging.WARNING)
+    logging.getLogger("ltx_core").setLevel(logging.WARNING)
+    logging.getLogger("ltx_pipelines").setLevel(logging.WARNING)
     logging.getLogger("transformers").setLevel(logging.WARNING)
 
 
@@ -87,8 +88,8 @@ async def lifespan(app: FastAPI):
     # Ensure temp directory exists
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
     logger.info(
-        "Worker started — model=%s, device=%s, temp_dir=%s",
-        settings.model_id,
+        "Worker started — checkpoint=%s, device=%s, temp_dir=%s",
+        settings.checkpoint_path,
         settings.device,
         settings.temp_dir,
     )

@@ -28,8 +28,29 @@ class WorkerSettings(BaseSettings):
     # --- Backend connection ---
     backend_url: str = "http://backend:8000"
 
-    # --- Video model ---
-    model_id: str = "THUDM/CogVideoX-2b"
+    # --- LTX-2 model files (volume-mounted at model_dir) ---
+    model_dir: Path = Path("/models")
+    checkpoint_filename: str = "ltx-2-19b-dev.safetensors"
+    distilled_lora_filename: str = "ltx-2-19b-distilled-lora-384.safetensors"
+    spatial_upsampler_filename: str = "ltx-2-spatial-upsampler-x2-1.0.safetensors"
+    gemma_dir_name: str = "gemma-3"
+    distilled_lora_strength: float = 0.6
+    enable_fp8: bool = False
+
+    # --- LTX-2 inference parameters ---
+    num_inference_steps: int = 40
+    frame_rate: float = 24.0
+    video_cfg_scale: float = 3.0
+    video_stg_scale: float = 1.0
+    video_rescale_scale: float = 0.7
+    video_modality_scale: float = 3.0
+    video_stg_blocks: list[int] = [29]
+    audio_cfg_scale: float = 7.0
+    audio_stg_scale: float = 1.0
+    audio_rescale_scale: float = 0.7
+    audio_modality_scale: float = 3.0
+    audio_stg_blocks: list[int] = [29]
+
     device: str = "cuda"
 
     # --- Temp storage ---
@@ -46,6 +67,23 @@ class WorkerSettings(BaseSettings):
 
     # --- Logging ---
     log_level: str = "INFO"
+
+    # --- Derived paths ---
+    @property
+    def checkpoint_path(self) -> Path:
+        return self.model_dir / self.checkpoint_filename
+
+    @property
+    def distilled_lora_path(self) -> Path:
+        return self.model_dir / self.distilled_lora_filename
+
+    @property
+    def spatial_upsampler_path(self) -> Path:
+        return self.model_dir / self.spatial_upsampler_filename
+
+    @property
+    def gemma_root(self) -> Path:
+        return self.model_dir / self.gemma_dir_name
 
 
 settings = WorkerSettings()

@@ -1,12 +1,11 @@
 """
-Video generation model loader and inference.
+Video generation model loader and inference using LTX-2.
 
-Loads a HuggingFace diffusers video pipeline (CogVideoX-2b by default)
-on first use via a lazy singleton pattern, then exposes a simple
-`generate_video()` function for the worker to call.
+Loads the LTX-2 TI2VidTwoStagesPipeline on first use via a lazy singleton
+pattern, then exposes a simple `generate_video()` function for the worker.
 
-The model is loaded once and kept in memory for the lifetime of the
-worker process. This avoids re-downloading / re-loading between jobs.
+The pipeline is loaded once and kept in memory for the lifetime of the
+worker process to avoid expensive re-initialization between jobs.
 """
 
 from __future__ import annotations
@@ -24,16 +23,16 @@ from worker.config import settings
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Resolution presets (width x height)
+# Resolution presets (width x height) — two-stage pipeline doubles internally
+# so these are the final output dimensions.
 # ---------------------------------------------------------------------------
 RESOLUTION_MAP: dict[str, tuple[int, int]] = {
-    "480p": (854, 480),
+    "480p": (768, 480),
     "720p": (1280, 720),
-    "1080p": (1920, 1080),
+    "1080p": (1536, 1024),
 }
 
-# CogVideoX generates at ~8 fps
-_DEFAULT_FPS: int = 8
+_DEFAULT_FRAME_RATE: float = 24.0
 
 
 @dataclass
@@ -52,7 +51,7 @@ _pipeline: Optional[object] = None
 
 
 def _get_pipeline():
-    """Load the video diffusion pipeline on first call.
+    """Load the LTX-2 TI2VidTwoStagesPipeline on first call.
 
     Subsequent calls return the cached instance.
     """
@@ -61,39 +60,60 @@ def _get_pipeline():
     if _pipeline is not None:
         return _pipeline
 
-    logger.info("Loading video model: %s on device: %s", settings.model_id, settings.device)
+    logger.info(
+        "Loading LTX-2 pipeline: checkpoint=%s, device=%s",
+        settings.checkpoint_path,
+        settings.device,
+    )
     start = time.monotonic()
 
     try:
-        from diffusers import CogVideoXPipeline
-        from diffusers.utils import export_to_video as _  # noqa: F401 — validate import
+        from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+        from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 
-        pipe = CogVideoXPipeline.from_pretrained(
-            settings.model_id,
-            torch_dtype=torch.float16,
+        for path, label in [
+            (settings.checkpoint_path, "checkpoint"),
+            (settings.distilled_lora_path, "distilled LoRA"),
+            (settings.spatial_upsampler_path, "spatial upsampler"),
+            (settings.gemma_root, "Gemma text encoder"),
+        ]:
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"Required model file not found: {path} ({label}). "
+                    "Ensure model files are mounted at the configured model_dir."
+                )
+
+        distilled_lora = [
+            LoraPathStrengthAndSDOps(
+                str(settings.distilled_lora_path),
+                settings.distilled_lora_strength,
+                LTXV_LORA_COMFY_RENAMING_MAP,
+            ),
+        ]
+
+        pipe = TI2VidTwoStagesPipeline(
+            checkpoint_path=str(settings.checkpoint_path),
+            distilled_lora=distilled_lora,
+            spatial_upsampler_path=str(settings.spatial_upsampler_path),
+            gemma_root=str(settings.gemma_root),
+            loras=[],
         )
-        pipe = pipe.to(settings.device)
-
-        # Enable memory-efficient attention if available
-        try:
-            pipe.enable_model_cpu_offload()
-            logger.info("Enabled model CPU offload for memory efficiency")
-        except Exception:
-            logger.info("CPU offload not available, using standard CUDA placement")
 
         _pipeline = pipe
         elapsed = time.monotonic() - start
-        logger.info("Model loaded in %.1fs", elapsed)
+        logger.info("LTX-2 pipeline loaded in %.1fs", elapsed)
         return _pipeline
 
     except torch.cuda.OutOfMemoryError:
-        logger.error("CUDA out of memory while loading model")
+        logger.error("CUDA out of memory while loading LTX-2 pipeline")
         raise RuntimeError(
-            f"Not enough GPU memory to load {settings.model_id}. "
-            "Consider using a smaller model or a larger GPU."
+            "Not enough GPU memory to load LTX-2 19B. "
+            "Consider using the FP8 checkpoint or a larger GPU."
         )
+    except FileNotFoundError:
+        raise
     except Exception as exc:
-        logger.error("Failed to load model %s: %s", settings.model_id, exc)
+        logger.error("Failed to load LTX-2 pipeline: %s", exc)
         raise RuntimeError(f"Model loading failed: {exc}") from exc
 
 
@@ -122,12 +142,19 @@ def generate_video(
     Raises:
         RuntimeError: If model loading or inference fails.
     """
-    from diffusers.utils import export_to_video
+    from ltx_core.components.guiders import MultiModalGuiderParams
+    from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+    from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE
+    from ltx_pipelines.utils.media_io import encode_video
 
     pipe = _get_pipeline()
 
     width, height = RESOLUTION_MAP.get(resolution, RESOLUTION_MAP["720p"])
-    num_frames = max(duration * _DEFAULT_FPS, 1)
+    frame_rate = settings.frame_rate
+    num_frames = max(int(duration * frame_rate), 1)
+    # LTX-2 expects an odd number of frames (2n+1 pattern)
+    if num_frames % 2 == 0:
+        num_frames += 1
 
     logger.info(
         "Generating video: prompt=%r, duration=%ds, resolution=%s (%dx%d), frames=%d",
@@ -139,23 +166,57 @@ def generate_video(
         num_frames,
     )
 
+    video_guider_params = MultiModalGuiderParams(
+        cfg_scale=settings.video_cfg_scale,
+        stg_scale=settings.video_stg_scale,
+        rescale_scale=settings.video_rescale_scale,
+        modality_scale=settings.video_modality_scale,
+        skip_step=0,
+        stg_blocks=settings.video_stg_blocks,
+    )
+
+    audio_guider_params = MultiModalGuiderParams(
+        cfg_scale=settings.audio_cfg_scale,
+        stg_scale=settings.audio_stg_scale,
+        rescale_scale=settings.audio_rescale_scale,
+        modality_scale=settings.audio_modality_scale,
+        skip_step=0,
+        stg_blocks=settings.audio_stg_blocks,
+    )
+
     start = time.monotonic()
 
     try:
-        result = pipe(
-            prompt=prompt,
-            num_frames=num_frames,
-            width=width,
-            height=height,
-            num_inference_steps=50,
-            guidance_scale=6.0,
-        )
-        frames = result.frames[0]  # first (only) batch entry
+        tiling_config = TilingConfig.default()
+        video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
 
-        # Ensure parent directory exists
+        from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT
+
+        video, audio = pipe(
+            prompt=prompt,
+            negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+            seed=int(time.time()) % (2**31),
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=settings.num_inference_steps,
+            video_guider_params=video_guider_params,
+            audio_guider_params=audio_guider_params,
+            images=[],
+            tiling_config=tiling_config,
+        )
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        export_to_video(frames, str(output_path), fps=_DEFAULT_FPS)
+        encode_video(
+            video=video,
+            fps=frame_rate,
+            audio=audio,
+            audio_sample_rate=AUDIO_SAMPLE_RATE,
+            output_path=str(output_path),
+            video_chunks_number=video_chunks_number,
+        )
 
         elapsed = time.monotonic() - start
         logger.info(
