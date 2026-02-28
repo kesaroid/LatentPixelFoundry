@@ -1,1 +1,0 @@
-# Monet-CycleGAN-G

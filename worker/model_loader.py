@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 # so these are the final output dimensions.
 # ---------------------------------------------------------------------------
 RESOLUTION_MAP: dict[str, tuple[int, int]] = {
-    "480p": (768, 480),
-    "720p": (1280, 720),
+    "480p": (768, 512),
+    "720p": (1280, 768),
     "1080p": (1536, 1024),
 }
 
