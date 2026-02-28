@@ -17,15 +17,16 @@
 #   - AWS CLI v2 configured (aws configure)
 #   - jq installed (brew install jq)
 #
-# Configuration is read from infra/worker.conf (created on first run).
+# Configuration: .env (secrets) then infra/worker.conf (deploy overrides).
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_DIR="${SCRIPT_DIR}/infra"
 CONF_FILE="${CONF_DIR}/worker.conf"
+ENV_FILE="${SCRIPT_DIR}/.env"
 
-# ── Defaults (overridden by worker.conf) ─────────────────────────────────────
+# ── Defaults (overridden by .env and worker.conf) ─────────────────────────────
 
 AWS_REGION="${AWS_REGION:-us-east-1}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-g5.xlarge}"
@@ -39,12 +40,23 @@ USE_SPOT="${USE_SPOT:-false}"
 SPOT_MAX_PRICE="${SPOT_MAX_PRICE:-0.50}"
 
 MODELS_S3_URI="${MODELS_S3_URI:-}"
+HF_TOKEN="${HF_TOKEN:-}"
+WORKER_DIR="${WORKER_DIR:-${SCRIPT_DIR}/../LatentPixelFoundry-worker/worker}"
 
-# ── Load config if it exists ─────────────────────────────────────────────────
+# ── Load config: .env first (secrets), then worker.conf (overrides) ───────────
 
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "$ENV_FILE"
+    set +a
+    # HF_TOKEN can come from .env as HUGGING_FACE_API_KEY
+    HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_API_KEY:-}}"
+fi
 if [[ -f "$CONF_FILE" ]]; then
     # shellcheck source=/dev/null
     source "$CONF_FILE"
+    HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_API_KEY:-}}"
 fi
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -121,8 +133,8 @@ remote_exec() {
 }
 
 remote_copy() {
-    local ip="$1"; shift
-    rsync -az --progress -e "ssh -o StrictHostKeyChecking=no -i ${KEY_PATH}" "$@" "${SSH_USER}@${ip}:~/project/"
+    local ip="$1" dest="$2"; shift 2
+    rsync -az --progress -e "ssh -o StrictHostKeyChecking=no -i ${KEY_PATH}" "$@" "${SSH_USER}@${ip}:${dest}"
 }
 
 # ── Ensure SSH key pair exists ───────────────────────────────────────────────
@@ -194,6 +206,83 @@ find_gpu_ami() {
     echo "$ami_id"
 }
 
+# ── Model downloads ──────────────────────────────────────────────────────────
+
+HF_BASE_URL="https://huggingface.co"
+
+LTX2_REPO="Lightricks/LTX-2"
+LTX2_FILES=(
+    "ltx-2-19b-dev.safetensors"
+    "ltx-2-19b-distilled-lora-384.safetensors"
+    "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+)
+
+GEMMA_REPO="google/gemma-3-1b-it"
+
+download_models() {
+    local ip="$1"
+
+    if [[ -n "$MODELS_S3_URI" ]]; then
+        log "Downloading model files from S3: ${MODELS_S3_URI}..."
+        remote_exec "$ip" "sudo mkdir -p ~/models && sudo chown -R ubuntu:ubuntu ~/models && aws s3 sync ${MODELS_S3_URI} ~/models"
+        return 0
+    fi
+
+    log "Downloading model files from Hugging Face..."
+    remote_exec "$ip" "sudo mkdir -p ~/models && sudo chown -R ubuntu:ubuntu ~/models"
+
+    local wget_auth=""
+    if [[ -n "$HF_TOKEN" ]]; then
+        wget_auth="--header='Authorization: Bearer ${HF_TOKEN}'"
+    fi
+
+    for f in "${LTX2_FILES[@]}"; do
+        log "  Checking ${f}..."
+        remote_exec "$ip" "
+            if [ -f ~/models/${f} ]; then
+                echo '  Already exists, skipping.'
+            else
+                echo '  Downloading ${f}...'
+                wget ${wget_auth} -O ~/models/${f} '${HF_BASE_URL}/${LTX2_REPO}/resolve/main/${f}'
+            fi
+        "
+    done
+
+    # Worker config expects 'upsampler' but HF repo uses 'upscaler'
+    remote_exec "$ip" "
+        cd ~/models
+        if [ -f ltx-2-spatial-upscaler-x2-1.0.safetensors ] && [ ! -f ltx-2-spatial-upsampler-x2-1.0.safetensors ]; then
+            ln -s ltx-2-spatial-upscaler-x2-1.0.safetensors ltx-2-spatial-upsampler-x2-1.0.safetensors
+            echo '  Created symlink: upscaler -> upsampler'
+        fi
+    "
+
+    # Gemma-3 text encoder (gated model, requires HF_TOKEN)
+    log "  Checking gemma-3 text encoder..."
+    if [[ -z "$HF_TOKEN" ]]; then
+        err "  HF_TOKEN is required to download Gemma-3 (gated model)."
+        err "  Set HUGGING_FACE_API_KEY in .env or HF_TOKEN in infra/worker.conf"
+        err "  Get a token at: https://huggingface.co/settings/tokens"
+        die "  Also accept the license at: ${HF_BASE_URL}/${GEMMA_REPO}"
+    fi
+
+    remote_exec "$ip" "
+        if [ -d ~/models/gemma-3 ] && [ \"\$(ls -A ~/models/gemma-3 2>/dev/null)\" ]; then
+            echo '  gemma-3/ already exists, skipping.'
+        else
+            echo '  Downloading Gemma-3 text encoder...'
+            pip3 install -q huggingface_hub 2>/dev/null
+            python3 -c \"
+from huggingface_hub import snapshot_download
+snapshot_download('${GEMMA_REPO}', local_dir='/home/ubuntu/models/gemma-3', token='${HF_TOKEN}')
+print('  Gemma-3 download complete.')
+\"
+        fi
+    "
+
+    log "All model files ready."
+}
+
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 cmd_up() {
@@ -254,14 +343,11 @@ cmd_up() {
     wait_for_ssh "$ip"
 
     log "Syncing project files..."
-    remote_exec "$ip" "mkdir -p ~/project"
-    remote_copy "$ip" "${SCRIPT_DIR}/worker/"
-    remote_copy "$ip" "${SCRIPT_DIR}/.env" 2>/dev/null || true
+    remote_exec "$ip" "mkdir -p ~/project/worker"
+    remote_copy "$ip" "~/project/worker/" "${WORKER_DIR}/"
+    remote_copy "$ip" "~/project/" "${SCRIPT_DIR}/.env" 2>/dev/null || true
 
-    if [[ -n "$MODELS_S3_URI" ]]; then
-        log "Downloading model files from ${MODELS_S3_URI}..."
-        remote_exec "$ip" "mkdir -p ~/models && aws s3 sync ${MODELS_S3_URI} ~/models"
-    fi
+    download_models "$ip"
 
     log "Building Docker image on instance..."
     remote_exec "$ip" "cd ~/project && docker build --platform linux/amd64 -t lpf-worker -f worker/Dockerfile ."
@@ -287,8 +373,8 @@ cmd_build() {
     [[ -z "$ip" ]] && die "No running instance found."
 
     log "Syncing project files..."
-    remote_exec "$ip" "mkdir -p ~/project"
-    remote_copy "$ip" "${SCRIPT_DIR}/worker/"
+    remote_exec "$ip" "mkdir -p ~/project/worker"
+    remote_copy "$ip" "~/project/worker/" "${WORKER_DIR}/"
 
     log "Rebuilding Docker image..."
     remote_exec "$ip" "cd ~/project && docker build --platform linux/amd64 -t lpf-worker -f worker/Dockerfile ."
@@ -437,7 +523,7 @@ AWS_REGION=us-east-1
 INSTANCE_TYPE=g5.xlarge
 
 # Root EBS volume size in GB (needs space for Docker images + model cache)
-VOLUME_SIZE=150
+VOLUME_SIZE=300
 
 # SSH key pair name and local path
 KEY_NAME=lpf-worker-key
@@ -451,9 +537,19 @@ USE_SPOT=false
 SPOT_MAX_PRICE=0.50
 
 # S3 URI for pre-cached model files (optional, speeds up cold start)
-# If empty, you must manually download models to ~/models on the instance.
+# If set, models are downloaded from S3 instead of Hugging Face.
 # Example: s3://my-bucket/lpf-models
 MODELS_S3_URI=
+
+# Hugging Face token for downloading models (required for Gemma-3)
+# Prefer setting HUGGING_FACE_API_KEY in .env; this overrides if set
+# Get yours at: https://huggingface.co/settings/tokens
+# Also accept the Gemma-3 license at: https://huggingface.co/google/gemma-3-1b-it
+# HF_TOKEN=
+
+# Path to the worker source code directory (absolute path)
+# Defaults to ../LatentPixelFoundry-worker/worker relative to this repo
+# WORKER_DIR=/path/to/LatentPixelFoundry-worker/worker
 CONF
 
     log "Config created at ${CONF_FILE}"
