@@ -30,15 +30,18 @@ class WorkerSettings(BaseSettings):
 
     # --- LTX-2 model files (volume-mounted at model_dir) ---
     model_dir: Path = Path("/models")
-    checkpoint_filename: str = "ltx-2-19b-dev.safetensors"
+    # FP8 (~25GB) fits g5.xlarge/2xlarge (32GB RAM). Full (~43GB) needs vm.overcommit_memory=1 or 64GB+ RAM.
+    checkpoint_filename: str = "ltx-2-19b-dev-fp8.safetensors"
     distilled_lora_filename: str = "ltx-2-19b-distilled-lora-384.safetensors"
     spatial_upsampler_filename: str = "ltx-2-spatial-upsampler-x2-1.0.safetensors"
     gemma_dir_name: str = "gemma-3"
     distilled_lora_strength: float = 0.6
-    enable_fp8: bool = False
+    # FP8 runtime quantization reduces VRAM ~40%; enable for 24GB GPUs (g5.xlarge, g5.2xlarge)
+    enable_fp8: bool = True
 
     # --- LTX-2 inference parameters ---
-    num_inference_steps: int = 40
+    # Fewer steps = less VRAM; 20–30 for low-VRAM, 40 for quality
+    num_inference_steps: int = 25
     frame_rate: float = 24.0
     video_cfg_scale: float = 3.0
     video_stg_scale: float = 1.0

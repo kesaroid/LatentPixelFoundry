@@ -6,6 +6,16 @@ Starts a mock backend to receive status callbacks and the video upload,
 then sends a generate request to the worker and waits for the full
 pipeline to complete.
 
+Model layout (worker expects /models via -v ~/models:/models):
+    /models/
+      ltx-2-19b-dev.safetensors (or ltx-2-19b-dev-fp8.safetensors)
+      ltx-2-19b-distilled-lora-384.safetensors
+      ltx-2-spatial-upsampler-x2-1.0.safetensors
+      gemma-3/                    <- LTX-2 layout (NOT flat google/gemma-3-1b-it)
+        tokenizer/                 (preprocessor_config.json, tokenizer.json, etc.)
+        text_encoder/             (config.json, model-*.safetensors, etc.)
+    Run scripts/download_gemma3.sh to get the correct Gemma-3 layout.
+
 Usage (on the EC2 instance):
     # 1. Make sure the worker container is running with BACKEND_URL
     #    pointing to this machine's mock server:
@@ -28,7 +38,7 @@ Usage (on the EC2 instance):
     #    --mock-port 8000                     Mock backend port (default)
     #    --prompt "your prompt"               Custom prompt
     #    --duration 2                         Duration in seconds (default: 2)
-    #    --resolution 480p                    Resolution (default: 480p)
+    #    --resolution 360p                    Resolution (default: 360p)
     #    --timeout 600                        Max wait in seconds (default: 600)
     #    --api-key test-key                   Worker API key (default: test-key)
 """
@@ -239,7 +249,7 @@ async def main():
         help="Generation prompt",
     )
     parser.add_argument("--duration", type=int, default=2, help="Video duration in seconds")
-    parser.add_argument("--resolution", default="480p", help="Resolution (480p, 720p, 1080p)")
+    parser.add_argument("--resolution", default="360p", help="Resolution (360p, 480p, 720p, 1080p)")
     parser.add_argument("--timeout", type=int, default=600, help="Max wait seconds")
     parser.add_argument("--api-key", default="test-key", help="Worker API key")
     args = parser.parse_args()

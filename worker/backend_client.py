@@ -29,8 +29,9 @@ _RETRYABLE_STATUS_CODES = {502, 503, 504, 408, 429}
 class BackendClient:
     """Async HTTP client for backend callbacks."""
 
-    def __init__(self) -> None:
-        self._base_url = settings.backend_url.rstrip("/")
+    def __init__(self, base_url: str | None = None) -> None:
+        """Initialize with optional base URL override (e.g. from request payload)."""
+        self._base_url = (base_url or settings.backend_url).rstrip("/")
         self._headers = {"X-Worker-API-Key": settings.worker_api_key}
         self._max_retries = settings.max_retries
         self._retry_delay = settings.retry_delay

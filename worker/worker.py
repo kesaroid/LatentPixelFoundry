@@ -156,7 +156,7 @@ async def process_job(request: GenerateRequest) -> None:
 
     On any failure, status is set to FAILED with an error message.
     """
-    client = BackendClient()
+    client = BackendClient(base_url=request.backend_url)
     temp_path = settings.temp_dir / f"{request.job_id}.mp4"
 
     try:

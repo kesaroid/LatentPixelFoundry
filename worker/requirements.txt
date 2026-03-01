@@ -8,6 +8,9 @@
 # Dockerfile. Only worker-specific deps are listed here.
 # =============================================================================
 
+# Pin transformers for Gemma3TextConfig compatibility (rope_local_base_freq)
+transformers==4.57.6
+
 # --- Web framework ---
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0

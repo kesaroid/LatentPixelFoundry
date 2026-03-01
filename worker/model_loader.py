@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # so these are the final output dimensions.
 # ---------------------------------------------------------------------------
 RESOLUTION_MAP: dict[str, tuple[int, int]] = {
+    "360p": (512, 384),   # Smallest, for low-VRAM / testing
     "480p": (768, 512),
     "720p": (1280, 768),
     "1080p": (1536, 1024),
@@ -61,15 +62,20 @@ def _get_pipeline():
         return _pipeline
 
     logger.info(
-        "Loading LTX-2 pipeline: checkpoint=%s, device=%s",
+        "Loading LTX-2 pipeline: checkpoint=%s, device=%s, fp8=%s, steps=%d",
         settings.checkpoint_path,
         settings.device,
+        settings.enable_fp8,
+        settings.num_inference_steps,
     )
     start = time.monotonic()
 
     try:
         from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+        from ltx_core.quantization import QuantizationPolicy
         from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
+
+        quantization = QuantizationPolicy.fp8_cast() if settings.enable_fp8 else None
 
         for path, label in [
             (settings.checkpoint_path, "checkpoint"),
@@ -97,6 +103,7 @@ def _get_pipeline():
             spatial_upsampler_path=str(settings.spatial_upsampler_path),
             gemma_root=str(settings.gemma_root),
             loras=[],
+            quantization=quantization,
         )
 
         _pipeline = pipe
@@ -149,7 +156,13 @@ def generate_video(
 
     pipe = _get_pipeline()
 
-    width, height = RESOLUTION_MAP.get(resolution, RESOLUTION_MAP["720p"])
+    if resolution not in RESOLUTION_MAP:
+        valid = ", ".join(RESOLUTION_MAP)
+        raise ValueError(
+            f"Unknown resolution {resolution!r}. Valid: {valid}. "
+            f"(Typo? e.g. 56p -> 360p)"
+        )
+    width, height = RESOLUTION_MAP[resolution]
     frame_rate = settings.frame_rate
     num_frames = max(int(duration * frame_rate), 1)
     # LTX-2 expects an odd number of frames (2n+1 pattern)

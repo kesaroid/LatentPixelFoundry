@@ -65,6 +65,8 @@ WORKDIR /app
 COPY worker/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
+RUN pip3 install httpx uvicorn fastapi python-multipart pydantic-settings
+
 # ---------------------------------------------------------------------------
 # Application code
 # ---------------------------------------------------------------------------
