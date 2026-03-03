@@ -211,8 +211,10 @@ find_gpu_ami() {
 HF_BASE_URL="https://huggingface.co"
 
 LTX2_REPO="Lightricks/LTX-2"
+# Default to FP8 checkpoint (~25GB) for g5.xlarge/g5.2xlarge (32GB RAM) to avoid mmap OOM
+CHECKPOINT_FILE="${CHECKPOINT_FILENAME:-ltx-2-19b-dev-fp8.safetensors}"
 LTX2_FILES=(
-    "ltx-2-19b-dev.safetensors"
+    "$CHECKPOINT_FILE"
     "ltx-2-19b-distilled-lora-384.safetensors"
     "ltx-2-spatial-upscaler-x2-1.0.safetensors"
 )
@@ -389,6 +391,10 @@ cmd_build() {
 _start_container() {
     local ip="$1"
     local models_mount="${MODELS_PATH:-$HOME/models}"
+
+    # Allow mmap of large model files (e.g. 43GB full checkpoint) when RAM+swap < file size.
+    # See: https://github.com/huggingface/safetensors/issues/528
+    remote_exec "$ip" "sudo sysctl -w vm.overcommit_memory=1 2>/dev/null || true"
 
     local env_flags=""
     if [[ -f "${SCRIPT_DIR}/.env" ]]; then

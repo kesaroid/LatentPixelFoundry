@@ -8,12 +8,12 @@ interface PromptFormProps {
   onJobCreated: () => void;
 }
 
-const RESOLUTIONS = ["720p", "1080p"] as const;
+const RESOLUTIONS = ["360p", "480p", "720p", "1080p"] as const;
 
 export function PromptForm({ onJobCreated }: PromptFormProps) {
   const [prompt, setPrompt] = useState("");
   const [duration, setDuration] = useState(5);
-  const [resolution, setResolution] = useState<string>("720p");
+  const [resolution, setResolution] = useState<string>("360p");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -28,7 +28,7 @@ export function PromptForm({ onJobCreated }: PromptFormProps) {
       await createJob({ prompt: prompt.trim(), duration, resolution });
       setPrompt("");
       setDuration(5);
-      setResolution("720p");
+      setResolution("360p");
       onJobCreated();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create job");
