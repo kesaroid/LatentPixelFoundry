@@ -4,7 +4,7 @@
 
 .PHONY: up down logs shell db-reset clean help
 .PHONY: worker-init worker-up worker-down worker-stop worker-start
-.PHONY: worker-build worker-status worker-ssh worker-logs
+.PHONY: worker-status worker-ssh worker-tunnel worker-logs
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -44,32 +44,32 @@ status: ## Show running containers
 	docker-compose ps
 
 # =============================================================================
-# GPU Worker Deployment (EC2)
+# GPU Worker Deployment (Vast.ai + ComfyUI)
 # =============================================================================
 
-worker-init: ## Create default EC2 config at infra/worker.conf
+worker-init: ## Create default Vast.ai config at infra/worker.conf
 	./deploy-worker.sh init
 
-worker-up: ## Launch GPU instance, build Docker image, start worker
+worker-up: ## Launch GPU instance on Vast.ai with ComfyUI + LTX-2
 	./deploy-worker.sh up
 
-worker-down: ## Terminate GPU instance (destroys everything)
+worker-down: ## Destroy Vast.ai instance (irreversible, deletes data)
 	./deploy-worker.sh down
 
-worker-stop: ## Stop GPU instance (preserves disk, no GPU charges)
+worker-stop: ## Stop Vast.ai instance (preserves data, small storage fee)
 	./deploy-worker.sh stop
 
-worker-start: ## Start a previously stopped GPU instance
+worker-start: ## Start a stopped Vast.ai instance
 	./deploy-worker.sh start
 
-worker-build: ## Rebuild Docker image and restart worker on running instance
-	./deploy-worker.sh build
-
-worker-status: ## Show GPU instance info (ID, state, IP)
+worker-status: ## Show Vast.ai instance info (GPU, status, cost)
 	./deploy-worker.sh status
 
-worker-ssh: ## SSH into the GPU instance
+worker-ssh: ## SSH into the Vast.ai instance
 	./deploy-worker.sh ssh
 
-worker-logs: ## Tail worker container logs
+worker-tunnel: ## Open SSH tunnel for ComfyUI (localhost:8188)
+	./deploy-worker.sh tunnel
+
+worker-logs: ## View Vast.ai instance logs
 	./deploy-worker.sh logs

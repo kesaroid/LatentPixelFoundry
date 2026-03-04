@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy-worker.sh — Provision and manage a GPU EC2 instance for the worker
+# deploy-worker.sh — Provision and manage a Vast.ai GPU instance for ComfyUI
 # =============================================================================
 #
 # Usage:
-#   ./deploy-worker.sh up        Launch instance, build Docker image, run worker
-#   ./deploy-worker.sh down      Terminate the instance
-#   ./deploy-worker.sh stop      Stop the instance (preserves EBS — no GPU cost)
+#   ./deploy-worker.sh up        Search offers, launch instance with ComfyUI
+#   ./deploy-worker.sh down      Destroy the instance (irreversible)
+#   ./deploy-worker.sh stop      Stop the instance (preserves data)
 #   ./deploy-worker.sh start     Start a previously stopped instance
-#   ./deploy-worker.sh status    Show instance state and IP
+#   ./deploy-worker.sh status    Show instance state and info
 #   ./deploy-worker.sh ssh       SSH into the instance
-#   ./deploy-worker.sh build     Rebuild and restart the worker container
-#   ./deploy-worker.sh logs      Tail worker container logs
+#   ./deploy-worker.sh tunnel    SSH tunnel — ComfyUI at http://localhost:8188
+#   ./deploy-worker.sh logs      Show instance logs
 #
 # Prerequisites:
-#   - AWS CLI v2 configured (aws configure)
-#   - jq installed (brew install jq)
+#   - vastai CLI installed (pip install vastai)
+#   - API key configured  (vastai set api-key YOUR_KEY)
+#   - jq installed         (brew install jq)
 #
 # Configuration: .env (secrets) then infra/worker.conf (deploy overrides).
 # =============================================================================
@@ -24,24 +25,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_DIR="${SCRIPT_DIR}/infra"
 CONF_FILE="${CONF_DIR}/worker.conf"
+ONSTART_FILE="${CONF_DIR}/onstart.sh"
 ENV_FILE="${SCRIPT_DIR}/.env"
 
 # ── Defaults (overridden by .env and worker.conf) ─────────────────────────────
 
-AWS_REGION="${AWS_REGION:-us-east-1}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-g5.xlarge}"
-VOLUME_SIZE="${VOLUME_SIZE:-150}"
-KEY_NAME="${KEY_NAME:-lpf-worker-key}"
-KEY_PATH="${KEY_PATH:-$HOME/.ssh/${KEY_NAME}.pem}"
-SG_NAME="${SG_NAME:-lpf-worker-sg}"
-INSTANCE_TAG="lpf-worker"
-SSH_USER="ubuntu"
-USE_SPOT="${USE_SPOT:-false}"
-SPOT_MAX_PRICE="${SPOT_MAX_PRICE:-0.50}"
-
-MODELS_S3_URI="${MODELS_S3_URI:-}"
+TEMPLATE_HASH="${TEMPLATE_HASH:-f3fbe8736dd0645619432c664c90d7c7}"
+GPU_MIN_RAM="${GPU_MIN_RAM:-24}"
+GPU_NAME="${GPU_NAME:-}"
+DISK_SIZE="${DISK_SIZE:-200}"
+MAX_PRICE="${MAX_PRICE:-}"
+INSTANCE_LABEL="lpf-worker"
 HF_TOKEN="${HF_TOKEN:-}"
-WORKER_DIR="${WORKER_DIR:-${SCRIPT_DIR}/../LatentPixelFoundry-worker/worker}"
 
 # ── Load config: .env first (secrets), then worker.conf (overrides) ───────────
 
@@ -50,7 +45,6 @@ if [[ -f "$ENV_FILE" ]]; then
     # shellcheck source=/dev/null
     source "$ENV_FILE"
     set +a
-    # HF_TOKEN can come from .env as HUGGING_FACE_API_KEY
     HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_API_KEY:-}}"
 fi
 if [[ -f "$CONF_FILE" ]]; then
@@ -69,440 +63,351 @@ require_cmd() {
     command -v "$1" &>/dev/null || die "'$1' is required but not installed."
 }
 
-# ── Find instance by tag ─────────────────────────────────────────────────────
+# SSH options for temporary Vast.ai instances (do not persist host keys)
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+
+# ── Find instance by label ──────────────────────────────────────────────────
 
 find_instance() {
-    aws ec2 describe-instances \
-        --region "$AWS_REGION" \
-        --filters "Name=tag:Name,Values=${INSTANCE_TAG}" \
-                  "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-        --query 'Reservations[0].Instances[0]' \
-        --output json 2>/dev/null | jq -r 'select(. != null)'
+    vastai show instances --raw 2>/dev/null \
+        | jq -r ".[] | select(.label == \"${INSTANCE_LABEL}\")" 2>/dev/null
 }
 
 get_instance_id() {
-    find_instance | jq -r '.InstanceId // empty'
+    find_instance | jq -r '.id // empty' | head -1
 }
 
-get_public_ip() {
-    find_instance | jq -r '.PublicIpAddress // empty'
+get_instance_status() {
+    find_instance | jq -r '.actual_status // .intended_status // empty' | head -1
 }
 
-get_instance_state() {
-    find_instance | jq -r '.State.Name // empty'
+get_ssh_info() {
+    local id="$1"
+    vastai ssh-url "$id" 2>/dev/null
 }
 
-wait_for_state() {
-    local target="$1" timeout_secs="${2:-300}" elapsed=0
-    log "Waiting for instance to reach state: ${target}..."
+# Parse host and port from ssh-url output.
+# Vast.ai may return either "ssh -p PORT root@HOST" or "ssh://root@HOST:PORT".
+parse_ssh_host() {
+    local ssh_url="$1"
+    echo "$ssh_url" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+parse_ssh_port() {
+    local ssh_url="$1"
+    # Try "ssh -p PORT ..." first, then "ssh://...HOST:PORT" (port after last colon)
+    echo "$ssh_url" | sed -E 's/.*-p ([0-9]+).*/\1/; s/.*:([0-9]+)$/\1/' | grep -E '^[0-9]+$' | head -1
+}
+
+wait_for_ready() {
+    local id="$1" timeout_secs="${2:-300}" elapsed=0
+    log "Waiting for instance ${id} to be ready..."
     while true; do
-        local state
-        state=$(get_instance_state)
-        if [[ "$state" == "$target" ]]; then
-            log "Instance is ${target}."
+        local status
+        status=$(vastai show instance "$id" --raw 2>/dev/null | jq -r '.actual_status // empty')
+        if [[ "$status" == "running" ]]; then
+            log "Instance is running."
             return 0
         fi
         if (( elapsed >= timeout_secs )); then
-            die "Timed out waiting for state ${target} (stuck at ${state})."
+            die "Timed out waiting for instance to be ready (status: ${status})."
         fi
-        sleep 5
-        elapsed=$((elapsed + 5))
+        sleep 10
+        elapsed=$((elapsed + 10))
     done
 }
 
-wait_for_ssh() {
-    local ip="$1" timeout_secs="${2:-300}" elapsed=0
-    log "Waiting for SSH on ${ip}..."
-    while true; do
-        if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-               -i "$KEY_PATH" "${SSH_USER}@${ip}" "echo ok" &>/dev/null; then
-            log "SSH is ready."
-            return 0
-        fi
-        if (( elapsed >= timeout_secs )); then
-            die "Timed out waiting for SSH."
-        fi
-        sleep 5
-        elapsed=$((elapsed + 5))
-    done
-}
+# ── Build onstart command ───────────────────────────────────────────────────
 
-remote_exec() {
-    local ip="$1"; shift
-    ssh -o StrictHostKeyChecking=no -i "$KEY_PATH" "${SSH_USER}@${ip}" "$@"
-}
-
-remote_copy() {
-    local ip="$1" dest="$2"; shift 2
-    rsync -az --progress -e "ssh -o StrictHostKeyChecking=no -i ${KEY_PATH}" "$@" "${SSH_USER}@${ip}:${dest}"
-}
-
-# ── Ensure SSH key pair exists ───────────────────────────────────────────────
-
-ensure_key_pair() {
-    if [[ -f "$KEY_PATH" ]]; then
-        return 0
+build_onstart_cmd() {
+    if [[ -f "$ONSTART_FILE" ]]; then
+        cat "$ONSTART_FILE"
+    else
+        cat << 'ONSTART'
+#!/bin/bash
+COMFY_DIR="/workspace/ComfyUI"
+LTX_DIR="${COMFY_DIR}/custom_nodes/ComfyUI-LTXVideo"
+if [ ! -d "$LTX_DIR" ]; then
+    cd "${COMFY_DIR}/custom_nodes"
+    git clone --depth 1 https://github.com/Lightricks/ComfyUI-LTXVideo.git
+    cd ComfyUI-LTXVideo
+    pip install -r requirements.txt
+fi
+ONSTART
     fi
-    log "Creating EC2 key pair '${KEY_NAME}'..."
-    aws ec2 create-key-pair \
-        --region "$AWS_REGION" \
-        --key-name "$KEY_NAME" \
-        --query 'KeyMaterial' \
-        --output text > "$KEY_PATH"
-    chmod 400 "$KEY_PATH"
-    log "Key saved to ${KEY_PATH}"
-}
-
-# ── Ensure security group exists ─────────────────────────────────────────────
-
-ensure_security_group() {
-    local sg_id
-    sg_id=$(aws ec2 describe-security-groups \
-        --region "$AWS_REGION" \
-        --filters "Name=group-name,Values=${SG_NAME}" \
-        --query 'SecurityGroups[0].GroupId' \
-        --output text 2>/dev/null)
-
-    if [[ "$sg_id" != "None" && -n "$sg_id" ]]; then
-        echo "$sg_id"
-        return 0
-    fi
-
-    log "Creating security group '${SG_NAME}'..."
-    sg_id=$(aws ec2 create-security-group \
-        --region "$AWS_REGION" \
-        --group-name "$SG_NAME" \
-        --description "LatentPixelFoundry GPU Worker" \
-        --query 'GroupId' --output text)
-
-    aws ec2 authorize-security-group-ingress \
-        --region "$AWS_REGION" --group-id "$sg_id" \
-        --protocol tcp --port 22 --cidr 0.0.0.0/0
-    aws ec2 authorize-security-group-ingress \
-        --region "$AWS_REGION" --group-id "$sg_id" \
-        --protocol tcp --port 9000 --cidr 0.0.0.0/0
-
-    log "Security group created: ${sg_id}"
-    echo "$sg_id"
-}
-
-# ── Find the best GPU AMI ───────────────────────────────────────────────────
-
-find_gpu_ami() {
-    local ami_id
-    ami_id=$(aws ec2 describe-images \
-        --region "$AWS_REGION" \
-        --owners amazon \
-        --filters \
-            "Name=name,Values=Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)*" \
-            "Name=state,Values=available" \
-            "Name=architecture,Values=x86_64" \
-        --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
-        --output text 2>/dev/null)
-
-    if [[ -z "$ami_id" || "$ami_id" == "None" ]]; then
-        die "Could not find a suitable NVIDIA GPU AMI in ${AWS_REGION}. Check your region or set a custom AMI in infra/worker.conf."
-    fi
-    echo "$ami_id"
-}
-
-# ── Model downloads ──────────────────────────────────────────────────────────
-
-HF_BASE_URL="https://huggingface.co"
-
-LTX2_REPO="Lightricks/LTX-2"
-# Default to FP8 checkpoint (~25GB) for g5.xlarge/g5.2xlarge (32GB RAM) to avoid mmap OOM
-CHECKPOINT_FILE="${CHECKPOINT_FILENAME:-ltx-2-19b-dev-fp8.safetensors}"
-LTX2_FILES=(
-    "$CHECKPOINT_FILE"
-    "ltx-2-19b-distilled-lora-384.safetensors"
-    "ltx-2-spatial-upscaler-x2-1.0.safetensors"
-)
-
-GEMMA_REPO="google/gemma-3-1b-it"
-
-download_models() {
-    local ip="$1"
-
-    if [[ -n "$MODELS_S3_URI" ]]; then
-        log "Downloading model files from S3: ${MODELS_S3_URI}..."
-        remote_exec "$ip" "sudo mkdir -p ~/models && sudo chown -R ubuntu:ubuntu ~/models && aws s3 sync ${MODELS_S3_URI} ~/models"
-        return 0
-    fi
-
-    log "Downloading model files from Hugging Face..."
-    remote_exec "$ip" "sudo mkdir -p ~/models && sudo chown -R ubuntu:ubuntu ~/models"
-
-    local wget_auth=""
-    if [[ -n "$HF_TOKEN" ]]; then
-        wget_auth="--header='Authorization: Bearer ${HF_TOKEN}'"
-    fi
-
-    for f in "${LTX2_FILES[@]}"; do
-        log "  Checking ${f}..."
-        remote_exec "$ip" "
-            if [ -f ~/models/${f} ]; then
-                echo '  Already exists, skipping.'
-            else
-                echo '  Downloading ${f}...'
-                wget ${wget_auth} -O ~/models/${f} '${HF_BASE_URL}/${LTX2_REPO}/resolve/main/${f}'
-            fi
-        "
-    done
-
-    # Worker config expects 'upsampler' but HF repo uses 'upscaler'
-    remote_exec "$ip" "
-        cd ~/models
-        if [ -f ltx-2-spatial-upscaler-x2-1.0.safetensors ] && [ ! -f ltx-2-spatial-upsampler-x2-1.0.safetensors ]; then
-            ln -s ltx-2-spatial-upscaler-x2-1.0.safetensors ltx-2-spatial-upsampler-x2-1.0.safetensors
-            echo '  Created symlink: upscaler -> upsampler'
-        fi
-    "
-
-    # Gemma-3 text encoder (gated model, requires HF_TOKEN)
-    log "  Checking gemma-3 text encoder..."
-    if [[ -z "$HF_TOKEN" ]]; then
-        err "  HF_TOKEN is required to download Gemma-3 (gated model)."
-        err "  Set HUGGING_FACE_API_KEY in .env or HF_TOKEN in infra/worker.conf"
-        err "  Get a token at: https://huggingface.co/settings/tokens"
-        die "  Also accept the license at: ${HF_BASE_URL}/${GEMMA_REPO}"
-    fi
-
-    remote_exec "$ip" "
-        if [ -d ~/models/gemma-3 ] && [ \"\$(ls -A ~/models/gemma-3 2>/dev/null)\" ]; then
-            echo '  gemma-3/ already exists, skipping.'
-        else
-            echo '  Downloading Gemma-3 text encoder...'
-            pip3 install -q huggingface_hub 2>/dev/null
-            python3 -c \"
-from huggingface_hub import snapshot_download
-snapshot_download('${GEMMA_REPO}', local_dir='/home/ubuntu/models/gemma-3', token='${HF_TOKEN}')
-print('  Gemma-3 download complete.')
-\"
-        fi
-    "
-
-    log "All model files ready."
 }
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 cmd_up() {
+    require_cmd vastai
+    require_cmd jq
+
     local existing_id
     existing_id=$(get_instance_id)
     if [[ -n "$existing_id" ]]; then
-        local state
-        state=$(get_instance_state)
-        if [[ "$state" == "running" ]]; then
+        local status
+        status=$(get_instance_status)
+        if [[ "$status" == "running" ]]; then
             log "Instance ${existing_id} is already running."
             cmd_status
             return 0
-        elif [[ "$state" == "stopped" ]]; then
-            log "Instance ${existing_id} is stopped. Starting it..."
+        else
+            log "Instance ${existing_id} exists (status: ${status}). Starting it..."
             cmd_start
             return 0
         fi
     fi
 
-    require_cmd aws
-    require_cmd jq
-    require_cmd rsync
-
-    ensure_key_pair
-    local sg_id ami_id instance_id
-    sg_id=$(ensure_security_group)
-    ami_id=$(find_gpu_ami)
-    log "Using AMI: ${ami_id}"
-    log "Instance type: ${INSTANCE_TYPE}"
-
-    local run_args=(
-        --region "$AWS_REGION"
-        --image-id "$ami_id"
-        --instance-type "$INSTANCE_TYPE"
-        --key-name "$KEY_NAME"
-        --security-group-ids "$sg_id"
-        --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${VOLUME_SIZE},\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]"
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_TAG}}]"
-        --query 'Instances[0].InstanceId'
-        --output text
-    )
-
-    if [[ "$USE_SPOT" == "true" ]]; then
-        log "Requesting spot instance (max price: \$${SPOT_MAX_PRICE}/hr)..."
-        run_args+=(--instance-market-options "{\"MarketType\":\"spot\",\"SpotOptions\":{\"SpotInstanceType\":\"one-time\",\"MaxPrice\":\"${SPOT_MAX_PRICE}\"}}")
+    # Build search query
+    local query="gpu_ram>=${GPU_MIN_RAM} num_gpus=1 disk_space>=${DISK_SIZE} inet_down>200 direct_port_count>3 reliability>0.95 rentable=true"
+    if [[ -n "$GPU_NAME" ]]; then
+        query="${query} gpu_name=${GPU_NAME}"
     fi
 
-    log "Launching EC2 instance..."
-    instance_id=$(aws ec2 run-instances "${run_args[@]}")
-    log "Instance ID: ${instance_id}"
+    log "Searching for GPU offers..."
+    log "  Query: ${query}"
 
-    wait_for_state "running"
+    local offers
+    offers=$(vastai search offers "${query}" -o 'dph_total' --raw 2>/dev/null)
 
-    local ip
-    ip=$(get_public_ip)
-    log "Public IP: ${ip}"
+    if [[ -z "$offers" || "$offers" == "[]" ]]; then
+        die "No offers found matching your criteria. Try relaxing GPU_MIN_RAM, DISK_SIZE, or GPU_NAME."
+    fi
 
-    wait_for_ssh "$ip"
+    # Apply price filter if set
+    local offer
+    if [[ -n "$MAX_PRICE" ]]; then
+        offer=$(echo "$offers" | jq -r "[.[] | select(.dph_total <= ${MAX_PRICE})] | first // empty")
+        if [[ -z "$offer" ]]; then
+            die "No offers found under \$${MAX_PRICE}/hr. Cheapest available: \$$(echo "$offers" | jq -r '.[0].dph_total')/hr"
+        fi
+    else
+        offer=$(echo "$offers" | jq -r '.[0] // empty')
+    fi
 
-    log "Syncing project files..."
-    remote_exec "$ip" "mkdir -p ~/project/worker"
-    remote_copy "$ip" "~/project/worker/" "${WORKER_DIR}/"
-    remote_copy "$ip" "~/project/" "${SCRIPT_DIR}/.env" 2>/dev/null || true
+    local offer_id gpu_name gpu_ram dph
+    offer_id=$(echo "$offer" | jq -r '.id')
+    gpu_name=$(echo "$offer" | jq -r '.gpu_name')
+    gpu_ram=$(echo "$offer" | jq -r '.gpu_ram')
+    dph=$(echo "$offer" | jq -r '.dph_total')
 
-    download_models "$ip"
+    log "Selected offer:"
+    log "  ID:    ${offer_id}"
+    log "  GPU:   ${gpu_name} (${gpu_ram}GB VRAM)"
+    log "  Price: \$${dph}/hr"
 
-    log "Building Docker image on instance..."
-    remote_exec "$ip" "cd ~/project && docker build --platform linux/amd64 -t lpf-worker -f worker/Dockerfile ."
+    # Build env flags
+    local env_args="-p 8188:8188"
+    if [[ -n "$HF_TOKEN" ]]; then
+        env_args="${env_args} -e HF_TOKEN=${HF_TOKEN}"
+    fi
 
-    _start_container "$ip"
+    # Read onstart script
+    local onstart_cmd
+    onstart_cmd=$(build_onstart_cmd)
+
+    log "Creating instance..."
+    local result
+    result=$(vastai create instance "$offer_id" \
+        --template_hash "$TEMPLATE_HASH" \
+        --disk "$DISK_SIZE" \
+        --ssh \
+        --direct \
+        --env "${env_args}" \
+        --onstart-cmd "$onstart_cmd" \
+        --raw 2>/dev/null)
+
+    local instance_id
+    instance_id=$(echo "$result" | jq -r '.new_contract // empty')
+    if [[ -z "$instance_id" ]]; then
+        err "Failed to create instance. Response:"
+        echo "$result" >&2
+        die "Instance creation failed."
+    fi
+
+    log "Instance created: ${instance_id}"
+
+    # Label the instance for identification
+    vastai label instance "$instance_id" "$INSTANCE_LABEL" 2>/dev/null || true
+
+    wait_for_ready "$instance_id"
 
     log ""
     log "================================================="
-    log "  Worker is live!"
-    log "  URL:  http://${ip}:9000"
-    log "  SSH:  ./deploy-worker.sh ssh"
-    log "  Logs: ./deploy-worker.sh logs"
-    log "================================================="
+    log "  ComfyUI instance is live!"
+    log "  Instance ID: ${instance_id}"
+    log "  GPU: ${gpu_name} (${gpu_ram}GB)"
+    log "  Cost: \$${dph}/hr"
     log ""
-    log "Update your local .env:"
-    log "  MOCK_WORKER=false"
-    log "  WORKER_URL=http://${ip}:9000/generate"
-}
-
-cmd_build() {
-    local ip
-    ip=$(get_public_ip)
-    [[ -z "$ip" ]] && die "No running instance found."
-
-    log "Syncing project files..."
-    remote_exec "$ip" "mkdir -p ~/project/worker"
-    remote_copy "$ip" "~/project/worker/" "${WORKER_DIR}/"
-
-    log "Rebuilding Docker image..."
-    remote_exec "$ip" "cd ~/project && docker build --platform linux/amd64 -t lpf-worker -f worker/Dockerfile ."
-
-    log "Restarting container..."
-    remote_exec "$ip" "docker rm -f lpf-worker 2>/dev/null || true"
-    _start_container "$ip"
-
-    log "Worker rebuilt and restarted at http://${ip}:9000"
-}
-
-_start_container() {
-    local ip="$1"
-    local models_mount="${MODELS_PATH:-$HOME/models}"
-
-    # Allow mmap of large model files (e.g. 43GB full checkpoint) when RAM+swap < file size.
-    # See: https://github.com/huggingface/safetensors/issues/528
-    remote_exec "$ip" "sudo sysctl -w vm.overcommit_memory=1 2>/dev/null || true"
-
-    local env_flags=""
-    if [[ -f "${SCRIPT_DIR}/.env" ]]; then
-        env_flags="--env-file ~/project/.env"
-    fi
-
-    remote_exec "$ip" "docker run -d \
-        --name lpf-worker \
-        --gpus all \
-        --restart unless-stopped \
-        -p 9000:9000 \
-        -v ~/models:/models \
-        ${env_flags} \
-        -e BACKEND_URL=\${BACKEND_URL:-http://host.docker.internal:8000} \
-        lpf-worker"
+    log "  Access ComfyUI:"
+    log "    ./deploy-worker.sh tunnel"
+    log "    Open http://localhost:8188"
+    log ""
+    log "  Other commands:"
+    log "    ./deploy-worker.sh ssh"
+    log "    ./deploy-worker.sh logs"
+    log "    ./deploy-worker.sh status"
+    log "================================================="
 }
 
 cmd_down() {
+    require_cmd vastai
+
     local instance_id
     instance_id=$(get_instance_id)
-    [[ -z "$instance_id" ]] && die "No instance found with tag '${INSTANCE_TAG}'."
+    [[ -z "$instance_id" ]] && die "No instance found with label '${INSTANCE_LABEL}'."
 
-    log "Terminating instance ${instance_id}..."
-    aws ec2 terminate-instances \
-        --region "$AWS_REGION" \
-        --instance-ids "$instance_id" > /dev/null
-    log "Instance termination initiated. It will be fully terminated in ~60s."
+    log "Destroying instance ${instance_id} (this is irreversible)..."
+    vastai destroy instance "$instance_id"
+    log "Instance destruction initiated."
 }
 
 cmd_stop() {
+    require_cmd vastai
+
     local instance_id
     instance_id=$(get_instance_id)
-    [[ -z "$instance_id" ]] && die "No instance found with tag '${INSTANCE_TAG}'."
+    [[ -z "$instance_id" ]] && die "No instance found with label '${INSTANCE_LABEL}'."
 
-    log "Stopping instance ${instance_id} (EBS preserved, no GPU charges)..."
-    aws ec2 stop-instances \
-        --region "$AWS_REGION" \
-        --instance-ids "$instance_id" > /dev/null
+    log "Stopping instance ${instance_id} (data preserved, small storage fee)..."
+    vastai stop instance "$instance_id"
     log "Instance stopping. Use './deploy-worker.sh start' to resume."
 }
 
 cmd_start() {
+    require_cmd vastai
+
     local instance_id
     instance_id=$(get_instance_id)
-    [[ -z "$instance_id" ]] && die "No instance found with tag '${INSTANCE_TAG}'."
+    [[ -z "$instance_id" ]] && die "No instance found with label '${INSTANCE_LABEL}'."
 
-    local state
-    state=$(get_instance_state)
-    if [[ "$state" == "running" ]]; then
+    local status
+    status=$(get_instance_status)
+    if [[ "$status" == "running" ]]; then
         log "Instance is already running."
         cmd_status
         return 0
     fi
 
     log "Starting instance ${instance_id}..."
-    aws ec2 start-instances \
-        --region "$AWS_REGION" \
-        --instance-ids "$instance_id" > /dev/null
+    vastai start instance "$instance_id"
 
-    wait_for_state "running"
-    local ip
-    ip=$(get_public_ip)
-    wait_for_ssh "$ip"
-
-    log "Instance running at ${ip}"
-    log "Worker URL: http://${ip}:9000"
+    wait_for_ready "$instance_id"
+    log "Instance is running. Use './deploy-worker.sh tunnel' to access ComfyUI."
 }
 
 cmd_status() {
+    require_cmd vastai
+    require_cmd jq
+
     local instance
     instance=$(find_instance)
     if [[ -z "$instance" ]]; then
-        log "No instance found with tag '${INSTANCE_TAG}'."
+        log "No instance found with label '${INSTANCE_LABEL}'."
         return 0
     fi
 
-    local id state ip type launch_time
-    id=$(echo "$instance" | jq -r '.InstanceId')
-    state=$(echo "$instance" | jq -r '.State.Name')
-    ip=$(echo "$instance" | jq -r '.PublicIpAddress // "N/A"')
-    type=$(echo "$instance" | jq -r '.InstanceType')
-    launch_time=$(echo "$instance" | jq -r '.LaunchTime')
+    local id status gpu_name gpu_ram dph ssh_url
+    id=$(echo "$instance" | jq -r '.id')
+    status=$(echo "$instance" | jq -r '.actual_status // .intended_status // "unknown"')
+    gpu_name=$(echo "$instance" | jq -r '.gpu_name // "N/A"')
+    gpu_ram=$(echo "$instance" | jq -r '.gpu_ram // "N/A"')
+    dph=$(echo "$instance" | jq -r '.dph_total // "N/A"')
 
     printf "\n"
     printf "  \033[1mInstance:\033[0m  %s\n" "$id"
-    printf "  \033[1mState:\033[0m     %s\n" "$state"
-    printf "  \033[1mType:\033[0m      %s\n" "$type"
-    printf "  \033[1mIP:\033[0m        %s\n" "$ip"
-    printf "  \033[1mLaunched:\033[0m  %s\n" "$launch_time"
-    if [[ "$state" == "running" && "$ip" != "N/A" ]]; then
-        printf "  \033[1mWorker:\033[0m    http://%s:9000\n" "$ip"
+    printf "  \033[1mStatus:\033[0m    %s\n" "$status"
+    printf "  \033[1mGPU:\033[0m       %s (%sGB VRAM)\n" "$gpu_name" "$gpu_ram"
+    printf "  \033[1mCost:\033[0m      \$%s/hr\n" "$dph"
+
+    if [[ "$status" == "running" ]]; then
+        ssh_url=$(get_ssh_info "$id" 2>/dev/null || echo "")
+        if [[ -n "$ssh_url" ]]; then
+            printf "  \033[1mSSH:\033[0m       %s\n" "$ssh_url"
+        fi
+        printf "  \033[1mComfyUI:\033[0m   ./deploy-worker.sh tunnel  →  http://localhost:8188\n"
     fi
     printf "\n"
 }
 
 cmd_ssh() {
-    local ip
-    ip=$(get_public_ip)
-    [[ -z "$ip" ]] && die "No running instance found."
-    log "Connecting to ${ip}..."
-    ssh -o StrictHostKeyChecking=no -i "$KEY_PATH" "${SSH_USER}@${ip}"
+    require_cmd vastai
+
+    local instance_id
+    instance_id=$(get_instance_id)
+    [[ -z "$instance_id" ]] && die "No running instance found."
+
+    local ssh_url
+    ssh_url=$(get_ssh_info "$instance_id")
+    [[ -z "$ssh_url" ]] && die "Could not get SSH info for instance ${instance_id}."
+
+    log "Connecting to instance ${instance_id}..."
+    log "  ${ssh_url}"
+
+    local host port
+    host=$(parse_ssh_host "$ssh_url")
+    port=$(parse_ssh_port "$ssh_url")
+
+    if [[ -n "$host" && -n "$port" ]]; then
+        ssh "${SSH_OPTS[@]}" -p "$port" "root@${host}"
+    else
+        # Fall back to running the ssh-url output directly
+        eval "$ssh_url"
+    fi
+}
+
+cmd_tunnel() {
+    require_cmd vastai
+
+    local instance_id
+    instance_id=$(get_instance_id)
+    [[ -z "$instance_id" ]] && die "No running instance found."
+
+    local ssh_url
+    ssh_url=$(get_ssh_info "$instance_id")
+    [[ -z "$ssh_url" ]] && die "Could not get SSH info for instance ${instance_id}."
+
+    local host port
+    host=$(parse_ssh_host "$ssh_url")
+    port=$(parse_ssh_port "$ssh_url")
+
+    if [[ -z "$host" || -z "$port" ]]; then
+        die "Could not parse SSH host/port from: ${ssh_url}"
+    fi
+
+    # Local port: optional override if 8188 is already in use (e.g. leftover tunnel)
+    local local_port="${TUNNEL_LOCAL_PORT:-8188}"
+
+    log "Opening SSH tunnel to ComfyUI..."
+    log "  Remote: ${host}:${port} → localhost:${local_port}"
+    log ""
+    log "  ComfyUI will be available at: http://localhost:${local_port}"
+    log "  Press Ctrl+C to close the tunnel."
+    log "  If the page does not load, ComfyUI may still be starting on the instance."
+    log "  Check progress: ./deploy-worker.sh logs"
+    if [[ "$local_port" != "8188" ]]; then
+        log "  (Using port ${local_port} because TUNNEL_LOCAL_PORT is set.)"
+    else
+        log "  (If port 8188 is in use: TUNNEL_LOCAL_PORT=8189 ./deploy-worker.sh tunnel)"
+    fi
+    log ""
+
+    ssh "${SSH_OPTS[@]}" \
+        -N \
+        -p "$port" \
+        -L "${local_port}:localhost:8188" \
+        "root@${host}"
 }
 
 cmd_logs() {
-    local ip
-    ip=$(get_public_ip)
-    [[ -z "$ip" ]] && die "No running instance found."
-    remote_exec "$ip" "docker logs -f lpf-worker"
+    require_cmd vastai
+
+    local instance_id
+    instance_id=$(get_instance_id)
+    [[ -z "$instance_id" ]] && die "No instance found with label '${INSTANCE_LABEL}'."
+
+    vastai logs "$instance_id"
 }
 
 # ── Init config ──────────────────────────────────────────────────────────────
@@ -516,46 +421,33 @@ cmd_init() {
 
     cat > "$CONF_FILE" << 'CONF'
 # =============================================================================
-# infra/worker.conf — GPU Worker EC2 Configuration
+# infra/worker.conf — GPU Worker Vast.ai Configuration
 # =============================================================================
 
-# AWS region for the GPU instance
-AWS_REGION=us-east-1
+# Vast.ai ComfyUI template hash
+# Default: official ComfyUI template from https://cloud.vast.ai/templates/
+TEMPLATE_HASH=f3fbe8736dd0645619432c664c90d7c7
 
-# EC2 instance type (GPU required)
-#   g5.xlarge  — 1x A10G 24GB VRAM, ~$1.01/hr on-demand
-#   g4dn.xlarge — 1x T4 16GB VRAM, ~$0.53/hr on-demand
-#   g6.xlarge  — 1x L4 24GB VRAM, ~$0.98/hr on-demand
-INSTANCE_TYPE=g5.xlarge
+# Minimum GPU VRAM in GB (24GB+ recommended for LTX-2)
+#   24GB — RTX 3090, RTX 4090, A10G, L4
+#   48GB — RTX 6000, A6000, L40
+#   80GB — A100, H100
+GPU_MIN_RAM=24
 
-# Root EBS volume size in GB (needs space for Docker images + model cache)
-VOLUME_SIZE=300
+# GPU model filter (optional, leave empty for any GPU meeting VRAM requirement)
+# Replace spaces with underscores: RTX_4090, RTX_3090, A100_SXM4, etc.
+GPU_NAME=
 
-# SSH key pair name and local path
-KEY_NAME=lpf-worker-key
-KEY_PATH=$HOME/.ssh/lpf-worker-key.pem
+# Disk size in GB (200GB+ recommended for ComfyUI + LTX-2 models)
+DISK_SIZE=200
 
-# Security group name
-SG_NAME=lpf-worker-sg
+# Maximum price per hour in USD (empty = no limit, cheapest available)
+MAX_PRICE=
 
-# Use spot instances for ~60-70% savings (may be interrupted)
-USE_SPOT=false
-SPOT_MAX_PRICE=0.50
-
-# S3 URI for pre-cached model files (optional, speeds up cold start)
-# If set, models are downloaded from S3 instead of Hugging Face.
-# Example: s3://my-bucket/lpf-models
-MODELS_S3_URI=
-
-# Hugging Face token for downloading models (required for Gemma-3)
+# Hugging Face token for gated models (e.g. Gemma-3 text encoder)
 # Prefer setting HUGGING_FACE_API_KEY in .env; this overrides if set
 # Get yours at: https://huggingface.co/settings/tokens
-# Also accept the Gemma-3 license at: https://huggingface.co/google/gemma-3-1b-it
 # HF_TOKEN=
-
-# Path to the worker source code directory (absolute path)
-# Defaults to ../LatentPixelFoundry-worker/worker relative to this repo
-# WORKER_DIR=/path/to/LatentPixelFoundry-worker/worker
 CONF
 
     log "Config created at ${CONF_FILE}"
@@ -570,14 +462,19 @@ Usage: ./deploy-worker.sh <command>
 
 Commands:
   init      Create default config at infra/worker.conf
-  up        Launch a GPU instance, build Docker image, start worker
-  down      Terminate the instance (destroys everything)
-  stop      Stop the instance (preserves disk, no GPU charges)
+  up        Launch a GPU instance with ComfyUI + LTX-2 on Vast.ai
+  down      Destroy the instance (irreversible, deletes data)
+  stop      Stop the instance (preserves data, small storage fee)
   start     Start a previously stopped instance
-  build     Rebuild Docker image and restart worker on running instance
-  status    Show instance info (ID, state, IP)
+  status    Show instance info (ID, GPU, status, cost)
   ssh       SSH into the instance
-  logs      Tail worker container logs
+  tunnel    Open SSH tunnel — ComfyUI at http://localhost:8188
+  logs      Show instance logs
+
+Prerequisites:
+  pip install vastai        # install Vast.ai CLI
+  vastai set api-key KEY    # configure API key
+  brew install jq           # install jq (macOS)
 
 EOF
 }
@@ -590,9 +487,9 @@ case "$ACTION" in
     down)   cmd_down ;;
     stop)   cmd_stop ;;
     start)  cmd_start ;;
-    build)  cmd_build ;;
     status) cmd_status ;;
     ssh)    cmd_ssh ;;
+    tunnel) cmd_tunnel ;;
     logs)   cmd_logs ;;
     *)      usage ;;
 esac
