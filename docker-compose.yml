@@ -1,0 +1,63 @@
+# =============================================================================
+# Local Development — docker-compose
+# =============================================================================
+# Services:
+#   postgres  — ARM-compatible PostgreSQL 16
+#   backend   — FastAPI backend (ARM-compatible python:3.11-slim)
+#
+# Usage:
+#   docker-compose up --build        # start everything
+#   docker-compose down -v           # stop and remove volumes
+#   docker-compose logs -f backend   # tail backend logs
+#
+# The worker is NOT included here — it runs on cloud GPU only.
+# In local dev, MOCK_WORKER=true simulates the worker in-process.
+# =============================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-videogen}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-videogen_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-videogen}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-videogen}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-videogen}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-videogen_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-videogen}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      WORKER_API_KEY: ${WORKER_API_KEY:-change-me-to-a-secure-random-string}
+      MOCK_WORKER: ${MOCK_WORKER:-true}
+      MOCK_DELAY_SECONDS: ${MOCK_DELAY_SECONDS:-5}
+      WORKER_URL: ${WORKER_URL:-http://localhost:9000/generate}
+      BACKEND_URL: ${BACKEND_URL:-http://backend:8000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      # Mount host video dir into the container path matching the config default.
+      # Config: generated_videos_dir = Path("generated_videos") → /app/generated_videos
+      - ./backend/generated_videos:/app/generated_videos
+
+volumes:
+  pgdata:
