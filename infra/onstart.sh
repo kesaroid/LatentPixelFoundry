@@ -53,11 +53,25 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Start ComfyUI on 8188 if not already listening
+# Start ComfyUI on 8188 if not already listening (retry once if first start fails)
 # -----------------------------------------------------------------------------
+_start_comfy() {
+    (cd "$COMFY_DIR" && nohup python main.py --listen 0.0.0.0 --port 8188 > /tmp/comfyui.log 2>&1 &)
+}
+
 if ! ss -tlnp 2>/dev/null | grep -q ':8188 '; then
     echo "[lpf] Starting ComfyUI on port 8188..."
-    (cd "$COMFY_DIR" && nohup python main.py --listen 0.0.0.0 --port 8188 > /tmp/comfyui.log 2>&1 &)
+    _start_comfy
+    sleep 15
+    if ! ss -tlnp 2>/dev/null | grep -q ':8188 '; then
+        echo "[lpf] ComfyUI not up after 15s; retrying start..."
+        _start_comfy
+        sleep 10
+    fi
+    if ! ss -tlnp 2>/dev/null | grep -q ':8188 '; then
+        echo "[lpf] ComfyUI still not listening on 8188. Last lines of /tmp/comfyui.log:"
+        tail -30 /tmp/comfyui.log 2>/dev/null || echo "(no log)"
+    fi
 fi
 
 echo "[lpf] Onstart complete."

@@ -66,6 +66,17 @@ require_cmd() {
 # SSH options for temporary Vast.ai instances (do not persist host keys)
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
 
+# #region agent log
+DEBUG_LOG="${SCRIPT_DIR}/.cursor/debug-2959b9.log"
+debug_log() {
+    local hypothesis_id="$1" msg="$2" data="${3:-{}}"
+    local ts
+    ts=$(($(date +%s) * 1000))
+    printf '{"sessionId":"2959b9","id":"log_%s_%s","timestamp":%s,"location":"deploy-worker.sh:cmd_tunnel","message":"%s","data":%s,"hypothesisId":"%s"}\n' \
+        "$ts" "$$" "$ts" "$msg" "$data" "$hypothesis_id" >> "$DEBUG_LOG" 2>/dev/null || true
+}
+# #endregion
+
 # ── Find instance by label ──────────────────────────────────────────────────
 
 find_instance() {
@@ -378,6 +389,39 @@ cmd_tunnel() {
 
     # Local port: optional override if 8188 is already in use (e.g. leftover tunnel)
     local local_port="${TUNNEL_LOCAL_PORT:-8188}"
+    local forward_str="${local_port}:localhost:8188"
+
+    # #region agent log
+    debug_log "H1" "parsed tunnel params" "{\"host\":\"$host\",\"ssh_port\":\"$port\",\"local_port\":\"$local_port\",\"forward\":\"$forward_str\"}"
+    # #endregion
+
+    # #region agent log — remote: is anything listening on 8188? (H2, H3, H5)
+    local remote_check
+    remote_check=$(ssh "${SSH_OPTS[@]}" -o ConnectTimeout=15 -o BatchMode=yes -p "$port" "root@${host}" \
+        'ss -tlnp 2>/dev/null | grep -E ":8188\s" || echo "NO_LISTEN_8188"; echo "---"; curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8188 2>/dev/null || echo "CURL_FAIL"' 2>/dev/null) || true
+    local remote_json
+    remote_json=$(echo "$remote_check" | jq -Rs . 2>/dev/null) || remote_json='"'"$(echo "$remote_check" | tr '\n' ' ' | sed 's/"/\\"/g')"'"'
+    debug_log "H2" "remote port 8188 check" "{\"remote_check\":$remote_json}"
+    # #endregion
+
+    # Wait for ComfyUI to listen on 8188 on the instance (fix for H2: nothing listening)
+    local wait_max=300 wait_interval=15 waited=0
+    if echo "$remote_check" | grep -q "NO_LISTEN_8188\|CURL_FAIL\|000"; then
+        log "  ComfyUI not ready yet; will wait up to $((wait_max/60)) minutes..."
+    fi
+    while echo "$remote_check" | grep -q "NO_LISTEN_8188\|CURL_FAIL\|000"; do
+        if (( waited >= wait_max )); then
+            debug_log "H2" "wait_timeout" "{\"waited\":$waited,\"remote_check\":$remote_json}"
+            die "ComfyUI is not listening on port 8188 on the instance after ${wait_max}s. Check: ./deploy-worker.sh logs"
+        fi
+        log "  Waiting for ComfyUI on instance (${waited}s)..."
+        sleep "$wait_interval"
+        waited=$((waited + wait_interval))
+        remote_check=$(ssh "${SSH_OPTS[@]}" -o ConnectTimeout=15 -o BatchMode=yes -p "$port" "root@${host}" \
+            'ss -tlnp 2>/dev/null | grep -E ":8188\s" || echo "NO_LISTEN_8188"; echo "---"; curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8188 2>/dev/null || echo "CURL_FAIL"' 2>/dev/null) || true
+        remote_json=$(echo "$remote_check" | jq -Rs . 2>/dev/null) || remote_json='"'"$(echo "$remote_check" | tr '\n' ' ' | sed 's/"/\\"/g')"'"'
+        debug_log "H2" "wait_poll" "{\"waited\":$waited,\"remote_check\":$remote_json}"
+    done
 
     log "Opening SSH tunnel to ComfyUI..."
     log "  Remote: ${host}:${port} → localhost:${local_port}"
@@ -392,6 +436,10 @@ cmd_tunnel() {
         log "  (If port 8188 is in use: TUNNEL_LOCAL_PORT=8189 ./deploy-worker.sh tunnel)"
     fi
     log ""
+
+    # #region agent log
+    debug_log "H4" "invoking ssh tunnel" "{\"forward\":\"${local_port}:localhost:8188\"}"
+    # #endregion
 
     ssh "${SSH_OPTS[@]}" \
         -N \
