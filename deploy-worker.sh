@@ -44,7 +44,7 @@ CHECKPOINT_FILENAME="${CHECKPOINT_FILENAME:-ltx-2-19b-dev-fp8.safetensors}"
 HF_TOKEN="${HF_TOKEN:-}"
 # Git repo to clone on EC2 (default: origin remote of current repo)
 GIT_REPO_URL="${GIT_REPO_URL:-}"
-GIT_BRANCH="${GIT_BRANCH:-main}"
+GIT_BRANCH="${GIT_BRANCH:-master}"
 
 # ── Load config: .env first (secrets), then worker.conf (overrides) ───────────
 
