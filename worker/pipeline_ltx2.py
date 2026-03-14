@@ -1,6 +1,6 @@
 """
 LTX-2 two-stage text-to-video pipeline.
-Loads from Hugging Face (cache under MODELS_DIR if set), runs Stage 1 + upsampler + Stage 2 LoRA, encodes to MP4.
+Loads from /models/ltx2 (downloaded by download_all_models.sh) — no Hub cache.
 """
 from __future__ import annotations
 
@@ -10,15 +10,8 @@ from pathlib import Path
 
 import torch
 
-# Optional: use /models as Hugging Face cache so downloads stay on the volume
 MODELS_DIR = os.environ.get("MODELS_DIR", "/models")
-if os.path.isdir(MODELS_DIR):
-    os.environ.setdefault("HF_HOME", MODELS_DIR)
-    os.environ.setdefault("HF_HUB_CACHE", os.path.join(MODELS_DIR, "hub"))
-
-# HF Hub token from .env (HUGGING_FACE_API_KEY) so downloads are authenticated and rate limits are higher
-if not os.environ.get("HF_TOKEN") and os.environ.get("HUGGING_FACE_API_KEY"):
-    os.environ["HF_TOKEN"] = os.environ["HUGGING_FACE_API_KEY"]
+LTX2_LOCAL_PATH = os.path.join(MODELS_DIR, "ltx2")
 
 # Resolution presets (width, height) — LTX-2 example uses 768x512
 RESOLUTION_MAP = {
@@ -63,10 +56,18 @@ def run(
     if seed is not None:
         generator = torch.Generator(device=device).manual_seed(seed)
 
-    # Load pipeline from Hub (cache under MODELS_DIR when HF_HOME is set)
+    # Load from /models/ltx2 (run download_all_models.sh first)
+    if not os.path.isdir(LTX2_LOCAL_PATH) or not os.path.isfile(
+        os.path.join(LTX2_LOCAL_PATH, "model_index.json")
+    ):
+        raise FileNotFoundError(
+            f"LTX-2 models not found at {LTX2_LOCAL_PATH}. "
+            "Run worker/scripts/download_all_models.sh on the instance first."
+        )
     pipe = LTX2Pipeline.from_pretrained(
-        "Lightricks/LTX-2",
+        LTX2_LOCAL_PATH,
         torch_dtype=torch.bfloat16,
+        local_files_only=True,
     )
     pipe.enable_sequential_cpu_offload(device=device)
 
@@ -87,9 +88,10 @@ def run(
     )
 
     latent_upsampler = LTX2LatentUpsamplerModel.from_pretrained(
-        "Lightricks/LTX-2",
+        LTX2_LOCAL_PATH,
         subfolder="latent_upsampler",
         torch_dtype=torch.bfloat16,
+        local_files_only=True,
     )
     upsample_pipe = LTX2LatentUpsamplePipeline(vae=pipe.vae, latent_upsampler=latent_upsampler)
     upsample_pipe.enable_model_cpu_offload(device=device)
@@ -101,9 +103,10 @@ def run(
 
     # Stage 2 distilled LoRA
     pipe.load_lora_weights(
-        "Lightricks/LTX-2",
+        LTX2_LOCAL_PATH,
         adapter_name="stage_2_distilled",
         weight_name="ltx-2-19b-distilled-lora-384.safetensors",
+        local_files_only=True,
     )
     pipe.set_adapters("stage_2_distilled", 1.0)
     pipe.vae.enable_tiling()

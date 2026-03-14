@@ -55,27 +55,15 @@ chmod +x ~/project/worker/scripts/*.sh
 ~/project/worker/scripts/download_all_models.sh
 ```
 
-Downloads (~60GB total):
-
-- `ltx-2-19b-dev-fp8.safetensors` (~25GB) — FP8 checkpoint for g5.xlarge
-- `ltx-2-19b-distilled-lora-384.safetensors` (~1.5GB)
-- `ltx-2-spatial-upscaler-x2-1.0.safetensors` + symlink
-- `gemma-3/` — text encoder from Lightricks/LTX-2
+Downloads the full `Lightricks/LTX-2` repo to `~/models/ltx2` in diffusers format (~60GB with fp8 checkpoint). Excludes full-precision checkpoints (saves ~70GB). Set `CHECKPOINT_FILENAME=ltx-2-19b-dev-fp8.safetensors` for g5.xlarge/g5.2xlarge.
 
 ### Option B: Manual download
 
+Replicate the script with `huggingface_hub`:
+
 ```bash
-cd ~/models
-BASE="https://huggingface.co/Lightricks/LTX-2/resolve/main"
-
-# LTX-2 files
-wget -O ltx-2-19b-dev-fp8.safetensors "$BASE/ltx-2-19b-dev-fp8.safetensors"
-wget -O ltx-2-19b-distilled-lora-384.safetensors "$BASE/ltx-2-19b-distilled-lora-384.safetensors"
-wget -O ltx-2-spatial-upscaler-x2-1.0.safetensors "$BASE/ltx-2-spatial-upscaler-x2-1.0.safetensors"
-ln -s ltx-2-spatial-upscaler-x2-1.0.safetensors ltx-2-spatial-upsampler-x2-1.0.safetensors
-
-# Gemma-3 text encoder
-~/project/worker/scripts/download_gemma3.sh
+pip install huggingface_hub
+python -c "from huggingface_hub import snapshot_download; snapshot_download('Lightricks/LTX-2', local_dir='$HOME/models/ltx2', local_dir_use_symlinks=False)"
 ```
 
 ### Option C: S3 (for deploy-worker.sh)
