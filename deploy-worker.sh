@@ -40,8 +40,10 @@ USE_SPOT="${USE_SPOT:-false}"
 SPOT_MAX_PRICE="${SPOT_MAX_PRICE:-0.50}"
 
 MODELS_S3_URI="${MODELS_S3_URI:-}"
+CHECKPOINT_FILENAME="${CHECKPOINT_FILENAME:-ltx-2-19b-dev-fp8.safetensors}"
 HF_TOKEN="${HF_TOKEN:-}"
-WORKER_DIR="${WORKER_DIR:-${SCRIPT_DIR}/../LatentPixelFoundry-worker/worker}"
+# Worker source: default to in-repo worker/; set WORKER_DIR in infra/worker.conf if using a separate repo
+WORKER_DIR="${WORKER_DIR:-${SCRIPT_DIR}/worker}"
 
 # ── Load config: .env first (secrets), then worker.conf (overrides) ───────────
 
@@ -163,26 +165,26 @@ ensure_security_group() {
         --query 'SecurityGroups[0].GroupId' \
         --output text 2>/dev/null)
 
-    if [[ "$sg_id" != "None" && -n "$sg_id" ]]; then
-        echo "$sg_id"
-        return 0
+    if [[ "$sg_id" == "None" || -z "$sg_id" ]]; then
+        log "Creating security group '${SG_NAME}'..."
+        sg_id=$(aws ec2 create-security-group \
+            --region "$AWS_REGION" \
+            --group-name "$SG_NAME" \
+            --description "LatentPixelFoundry GPU Worker" \
+            --query 'GroupId' --output text)
+        aws ec2 authorize-security-group-ingress \
+            --region "$AWS_REGION" --group-id "$sg_id" \
+            --protocol tcp --port 22 --cidr 0.0.0.0/0
+        aws ec2 authorize-security-group-ingress \
+            --region "$AWS_REGION" --group-id "$sg_id" \
+            --protocol tcp --port 9000 --cidr 0.0.0.0/0
+        log "Security group created: ${sg_id}"
+    else
+        # Ensure port 9000 is allowed (idempotent; duplicate rule is ignored)
+        aws ec2 authorize-security-group-ingress \
+            --region "$AWS_REGION" --group-id "$sg_id" \
+            --protocol tcp --port 9000 --cidr 0.0.0.0/0 2>/dev/null || true
     fi
-
-    log "Creating security group '${SG_NAME}'..."
-    sg_id=$(aws ec2 create-security-group \
-        --region "$AWS_REGION" \
-        --group-name "$SG_NAME" \
-        --description "LatentPixelFoundry GPU Worker" \
-        --query 'GroupId' --output text)
-
-    aws ec2 authorize-security-group-ingress \
-        --region "$AWS_REGION" --group-id "$sg_id" \
-        --protocol tcp --port 22 --cidr 0.0.0.0/0
-    aws ec2 authorize-security-group-ingress \
-        --region "$AWS_REGION" --group-id "$sg_id" \
-        --protocol tcp --port 9000 --cidr 0.0.0.0/0
-
-    log "Security group created: ${sg_id}"
     echo "$sg_id"
 }
 
@@ -212,9 +214,8 @@ HF_BASE_URL="https://huggingface.co"
 
 LTX2_REPO="Lightricks/LTX-2"
 # Default to FP8 checkpoint (~25GB) for g5.xlarge/g5.2xlarge (32GB RAM) to avoid mmap OOM
-CHECKPOINT_FILE="${CHECKPOINT_FILENAME:-ltx-2-19b-dev-fp8.safetensors}"
 LTX2_FILES=(
-    "$CHECKPOINT_FILE"
+    "$CHECKPOINT_FILENAME"
     "ltx-2-19b-distilled-lora-384.safetensors"
     "ltx-2-spatial-upscaler-x2-1.0.safetensors"
 )
@@ -230,9 +231,27 @@ download_models() {
         return 0
     fi
 
-    log "Downloading model files from Hugging Face..."
+    # Option A (README_RUNTIME): run scripts/download_all_models.sh on instance if present
     remote_exec "$ip" "sudo mkdir -p ~/models && sudo chown -R ubuntu:ubuntu ~/models"
+    if remote_exec "$ip" "
+        if [ -f ~/project/worker/scripts/download_all_models.sh ]; then
+            chmod +x ~/project/worker/scripts/*.sh 2>/dev/null || true
+            export CHECKPOINT_FILENAME='${CHECKPOINT_FILENAME}'
+            export HF_TOKEN='${HF_TOKEN}'
+            ~/project/worker/scripts/download_all_models.sh
+        else
+            exit 2
+        fi
+    "; then
+        log "All model files ready (Option A)."
+        return 0
+    fi
+    local ret=$?
+    if [[ $ret -ne 2 ]]; then
+        die "Model download failed (exit $ret). Fix errors above or set MODELS_S3_URI."
+    fi
 
+    log "Downloading model files from Hugging Face (inline fallback)..."
     local wget_auth=""
     if [[ -n "$HF_TOKEN" ]]; then
         wget_auth="--header='Authorization: Bearer ${HF_TOKEN}'"
@@ -250,7 +269,6 @@ download_models() {
         "
     done
 
-    # Worker config expects 'upsampler' but HF repo uses 'upscaler'
     remote_exec "$ip" "
         cd ~/models
         if [ -f ltx-2-spatial-upscaler-x2-1.0.safetensors ] && [ ! -f ltx-2-spatial-upsampler-x2-1.0.safetensors ]; then
@@ -259,12 +277,10 @@ download_models() {
         fi
     "
 
-    # Gemma-3 text encoder (gated model, requires HF_TOKEN)
     log "  Checking gemma-3 text encoder..."
     if [[ -z "$HF_TOKEN" ]]; then
         err "  HF_TOKEN is required to download Gemma-3 (gated model)."
         err "  Set HUGGING_FACE_API_KEY in .env or HF_TOKEN in infra/worker.conf"
-        err "  Get a token at: https://huggingface.co/settings/tokens"
         die "  Also accept the license at: ${HF_BASE_URL}/${GEMMA_REPO}"
     fi
 
@@ -344,6 +360,13 @@ cmd_up() {
 
     wait_for_ssh "$ip"
 
+    if [[ ! -d "${WORKER_DIR}" ]]; then
+        die "WORKER_DIR not found: ${WORKER_DIR}. Create worker/ in this repo or set WORKER_DIR in infra/worker.conf to your worker path (e.g. /path/to/LatentPixelFoundry-worker/worker)."
+    fi
+    if [[ ! -f "${WORKER_DIR}/Dockerfile" ]]; then
+        die "No Dockerfile in WORKER_DIR (${WORKER_DIR}). Add a worker Dockerfile or set WORKER_DIR in infra/worker.conf to a directory that has one."
+    fi
+
     log "Syncing project files..."
     remote_exec "$ip" "mkdir -p ~/project/worker"
     remote_copy "$ip" "~/project/worker/" "${WORKER_DIR}/"
@@ -374,9 +397,16 @@ cmd_build() {
     ip=$(get_public_ip)
     [[ -z "$ip" ]] && die "No running instance found."
 
+    [[ ! -d "${WORKER_DIR}" ]] && die "WORKER_DIR not found: ${WORKER_DIR}"
+    [[ ! -f "${WORKER_DIR}/Dockerfile" ]] && die "No Dockerfile in WORKER_DIR: ${WORKER_DIR}"
+
     log "Syncing project files..."
     remote_exec "$ip" "mkdir -p ~/project/worker"
     remote_copy "$ip" "~/project/worker/" "${WORKER_DIR}/"
+    remote_copy "$ip" "~/project/" "${SCRIPT_DIR}/.env" 2>/dev/null || true
+
+    log "Ensuring models (Option A if script present)..."
+    download_models "$ip"
 
     log "Rebuilding Docker image..."
     remote_exec "$ip" "cd ~/project && docker build --platform linux/amd64 -t lpf-worker -f worker/Dockerfile ."
@@ -396,20 +426,22 @@ _start_container() {
     # See: https://github.com/huggingface/safetensors/issues/528
     remote_exec "$ip" "sudo sysctl -w vm.overcommit_memory=1 2>/dev/null || true"
 
-    local env_flags=""
-    if [[ -f "${SCRIPT_DIR}/.env" ]]; then
-        env_flags="--env-file ~/project/.env"
-    fi
-
-    remote_exec "$ip" "docker run -d \
-        --name lpf-worker \
-        --gpus all \
-        --restart unless-stopped \
-        -p 9000:9000 \
-        -v ~/models:/models \
-        ${env_flags} \
-        -e BACKEND_URL=\${BACKEND_URL:-http://host.docker.internal:8000} \
-        lpf-worker"
+    # Use --env-file only if .env exists on the instance (full path: Docker does not expand ~)
+    remote_exec "$ip" '
+        env_file="/home/ubuntu/project/.env"
+        env_flags=""
+        [ -f "$env_file" ] && env_flags="--env-file $env_file"
+        docker run -d \
+            --name lpf-worker \
+            --gpus all \
+            --restart unless-stopped \
+            -p 9000:9000 \
+            -v /home/ubuntu/models:/models \
+            $env_flags \
+            -e CHECKPOINT_FILENAME='"${CHECKPOINT_FILENAME}"' \
+            -e BACKEND_URL=${BACKEND_URL:-http://host.docker.internal:8000} \
+            lpf-worker
+    '
 }
 
 cmd_down() {

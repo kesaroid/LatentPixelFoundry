@@ -138,6 +138,44 @@ docker run -d \
 | `CHECKPOINT_FILENAME` | `ltx-2-19b-dev.safetensors` | Checkpoint file in `/models` |
 | `ENABLE_FP8` | `false` | Use FP8 inference (set `true` with FP8 checkpoint) |
 
+### Is LTX-2 running inside the container?
+
+**Out of the box: no.** The container runs a small FastAPI app that serves **GET /health** and **POST /generate** (accepts job, returns 202). It does **not** load the LTX-2 model or run inference yet—`/generate` is a stub. So the container is running, but LTX-2 is not “spun up” until you add inference code.
+
+### How to run and use the worker
+
+1. **Container is already running** after `./deploy-worker.sh up` or `./deploy-worker.sh build` (port 9000 on the instance).
+
+2. **Check it’s up** (from your Mac; use IP from `./deploy-worker.sh status`):
+   ```bash
+   curl http://<INSTANCE_IP>:9000/health
+   # → {"status":"ok"}
+   ```
+
+3. **Trigger from the app**: In local `.env` set `MOCK_WORKER=false`, `WORKER_URL=http://<INSTANCE_IP>:9000/generate`, and `WORKER_API_KEY` to match the worker. Create a job from the frontend; the backend will POST to the worker. The worker will accept (202) but will not generate video until LTX-2 is wired in.
+
+4. **Trigger manually** (for testing):
+   ```bash
+   curl -X POST http://<INSTANCE_IP>:9000/generate \
+     -H "Content-Type: application/json" \
+     -d '{"job_id":"test-1","prompt":"A cat","duration":5,"resolution":"720p","backend_url":"http://backend:8000","upload_url":"http://backend:8000/api/jobs/test-1/upload","status_url":"http://backend:8000/api/jobs/test-1/status"}'
+   # → 202 with {"status":"accepted","job_id":"test-1"}
+   ```
+
+### How to run real LTX-2 inference
+
+The worker implements the full two-stage LTX-2 pipeline in `worker/pipeline_ltx2.py` and `worker/main.py`: on POST `/generate` it runs the pipeline, PATCHes `status_url`, and uploads the MP4 to `upload_url`. **Test the pipeline with a single prompt** (run **inside the worker container**; the host Python does not have torch/diffusers):
+
+```bash
+# From your Mac: SSH to instance then run inside the container
+./deploy-worker.sh ssh
+# On the instance:
+docker exec -it lpf-worker python3 /app/scripts/run_prompt.py --prompt "A cat walking in the rain" --duration 5 --output /tmp/test.mp4
+# Output is in the container at /tmp/test.mp4; copy out with:
+docker cp lpf-worker:/tmp/test.mp4 /tmp/test.mp4
+# Options: --resolution 720p|480p|1080p, --seed 42
+```
+
 ---
 
 ## 4. End-to-End Test
@@ -182,12 +220,47 @@ python3 test_generate.py --duration 2 --resolution 480p --prompt "A cat walking 
 
 ---
 
-## 5. Quick Reference
+## 5. Troubleshooting: Connection refused on port 9000
+
+If `curl http://<INSTANCE_IP>:9000/health` returns **Connection refused**:
+
+**1. Check the container on the instance**
+
+```bash
+./deploy-worker.sh ssh
+# On the instance:
+docker ps -a
+docker logs lpf-worker
+```
+
+- If `lpf-worker` is **Exited**: see `docker logs lpf-worker` for the error (e.g. missing env, port in use). Fix and run `docker start lpf-worker`, or from your Mac run `./deploy-worker.sh build` to sync, rebuild, and restart.
+- If the container is **Running** but you still get connection refused from your Mac, the firewall is likely blocking port 9000.
+
+**2. Open port 9000 in the instance security group**
+
+If the security group was created before port 9000 was added, allow it (from your Mac, replace `lpf-worker-sg` and `us-east-1` if you use different names/region):
+
+```bash
+aws ec2 authorize-security-group-ingress \
+  --region us-east-1 \
+  --group-name lpf-worker-sg \
+  --protocol tcp --port 9000 --cidr 0.0.0.0/0
+```
+
+If you get "Duplicate" error, the rule already exists (check instance subnet / NACLs). Then retry:
+
+```bash
+curl http://<INSTANCE_IP>:9000/health
+```
+
+---
+
+## 6. Quick Reference
 
 ### Health check
 
 ```bash
-curl http://localhost:9000/health
+curl http://<INSTANCE_IP>:9000/health
 ```
 
 ### Container logs
