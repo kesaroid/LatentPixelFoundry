@@ -44,7 +44,8 @@ CHECKPOINT_FILENAME="${CHECKPOINT_FILENAME:-ltx-2-19b-dev-fp8.safetensors}"
 HF_TOKEN="${HF_TOKEN:-}"
 # Git repo to clone on EC2 (default: origin remote of current repo)
 GIT_REPO_URL="${GIT_REPO_URL:-}"
-GIT_BRANCH="${GIT_BRANCH:-master}"
+# Default: use current branch so deploy includes worker scripts (e.g. download_all_models.sh)
+GIT_BRANCH="${GIT_BRANCH:-}"
 
 # ── Load config: .env first (secrets), then worker.conf (overrides) ───────────
 
@@ -66,6 +67,8 @@ fi
 if [[ -z "${GIT_REPO_URL:-}" ]]; then
     GIT_REPO_URL=$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null || true)
 fi
+# Resolve GIT_BRANCH: default to current branch (so deploy uses worker scripts) or master
+[[ -z "${GIT_BRANCH:-}" ]] && GIT_BRANCH=$(git -C "$SCRIPT_DIR" branch --show-current 2>/dev/null || echo "master")
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
