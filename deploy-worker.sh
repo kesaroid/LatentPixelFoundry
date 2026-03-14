@@ -42,8 +42,9 @@ SPOT_MAX_PRICE="${SPOT_MAX_PRICE:-0.50}"
 MODELS_S3_URI="${MODELS_S3_URI:-}"
 CHECKPOINT_FILENAME="${CHECKPOINT_FILENAME:-ltx-2-19b-dev-fp8.safetensors}"
 HF_TOKEN="${HF_TOKEN:-}"
-# Worker source: default to in-repo worker/; set WORKER_DIR in infra/worker.conf if using a separate repo
-WORKER_DIR="${WORKER_DIR:-${SCRIPT_DIR}/worker}"
+# Git repo to clone on EC2 (default: origin remote of current repo)
+GIT_REPO_URL="${GIT_REPO_URL:-}"
+GIT_BRANCH="${GIT_BRANCH:-main}"
 
 # ── Load config: .env first (secrets), then worker.conf (overrides) ───────────
 
@@ -59,6 +60,11 @@ if [[ -f "$CONF_FILE" ]]; then
     # shellcheck source=/dev/null
     source "$CONF_FILE"
     HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_API_KEY:-}}"
+fi
+
+# Resolve GIT_REPO_URL from git origin if not set
+if [[ -z "${GIT_REPO_URL:-}" ]]; then
+    GIT_REPO_URL=$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null || true)
 fi
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -137,6 +143,26 @@ remote_exec() {
 remote_copy() {
     local ip="$1" dest="$2"; shift 2
     rsync -az --progress -e "ssh -o StrictHostKeyChecking=no -i ${KEY_PATH}" "$@" "${SSH_USER}@${ip}:${dest}"
+}
+
+# ── Sync project via git clone + .env rsync ───────────────────────────────────
+
+sync_project() {
+    local ip="$1" mode="${2:-up}"
+    [[ -z "$GIT_REPO_URL" ]] && die "GIT_REPO_URL is not set. Set it in infra/worker.conf or ensure this repo has a git origin."
+
+    if [[ "$mode" == "up" ]]; then
+        log "Cloning repo (branch: ${GIT_BRANCH})..."
+        remote_exec "$ip" "rm -rf ~/project && git clone --branch '${GIT_BRANCH}' --single-branch '${GIT_REPO_URL}' ~/project"
+    else
+        log "Pulling latest..."
+        remote_exec "$ip" "cd ~/project && git pull origin '${GIT_BRANCH}'"
+    fi
+
+    if [[ -f "$ENV_FILE" ]]; then
+        log "Syncing .env..."
+        remote_copy "$ip" "~/project/" "${ENV_FILE}"
+    fi
 }
 
 # ── Ensure SSH key pair exists ───────────────────────────────────────────────
@@ -360,17 +386,7 @@ cmd_up() {
 
     wait_for_ssh "$ip"
 
-    if [[ ! -d "${WORKER_DIR}" ]]; then
-        die "WORKER_DIR not found: ${WORKER_DIR}. Create worker/ in this repo or set WORKER_DIR in infra/worker.conf to your worker path (e.g. /path/to/LatentPixelFoundry-worker/worker)."
-    fi
-    if [[ ! -f "${WORKER_DIR}/Dockerfile" ]]; then
-        die "No Dockerfile in WORKER_DIR (${WORKER_DIR}). Add a worker Dockerfile or set WORKER_DIR in infra/worker.conf to a directory that has one."
-    fi
-
-    log "Syncing project files..."
-    remote_exec "$ip" "mkdir -p ~/project/worker"
-    remote_copy "$ip" "~/project/worker/" "${WORKER_DIR}/"
-    remote_copy "$ip" "~/project/" "${SCRIPT_DIR}/.env" 2>/dev/null || true
+    sync_project "$ip" up
 
     download_models "$ip"
 
@@ -397,13 +413,7 @@ cmd_build() {
     ip=$(get_public_ip)
     [[ -z "$ip" ]] && die "No running instance found."
 
-    [[ ! -d "${WORKER_DIR}" ]] && die "WORKER_DIR not found: ${WORKER_DIR}"
-    [[ ! -f "${WORKER_DIR}/Dockerfile" ]] && die "No Dockerfile in WORKER_DIR: ${WORKER_DIR}"
-
-    log "Syncing project files..."
-    remote_exec "$ip" "mkdir -p ~/project/worker"
-    remote_copy "$ip" "~/project/worker/" "${WORKER_DIR}/"
-    remote_copy "$ip" "~/project/" "${SCRIPT_DIR}/.env" 2>/dev/null || true
+    sync_project "$ip" build
 
     log "Ensuring models (Option A if script present)..."
     download_models "$ip"
@@ -585,9 +595,9 @@ MODELS_S3_URI=
 # Also accept the Gemma-3 license at: https://huggingface.co/google/gemma-3-1b-it
 # HF_TOKEN=
 
-# Path to the worker source code directory (absolute path)
-# Defaults to ../LatentPixelFoundry-worker/worker relative to this repo
-# WORKER_DIR=/path/to/LatentPixelFoundry-worker/worker
+# Git repo to clone on EC2 (default: origin of the repo running this script)
+# GIT_REPO_URL=
+# GIT_BRANCH=main
 CONF
 
     log "Config created at ${CONF_FILE}"
