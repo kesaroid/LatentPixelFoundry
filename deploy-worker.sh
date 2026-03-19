@@ -39,6 +39,9 @@ SSH_USER="ubuntu"
 USE_SPOT="${USE_SPOT:-false}"
 SPOT_MAX_PRICE="${SPOT_MAX_PRICE:-0.50}"
 
+INSTANCE_PROFILE_NAME="${INSTANCE_PROFILE_NAME:-lpf-worker-profile}"
+IAM_ROLE_NAME="${IAM_ROLE_NAME:-lpf-worker-role}"
+
 MODELS_S3_URI="${MODELS_S3_URI:-}"
 CHECKPOINT_FILENAME="${CHECKPOINT_FILENAME:-ltx-2-19b-dev-fp8.safetensors}"
 HF_TOKEN="${HF_TOKEN:-}"
@@ -217,6 +220,73 @@ ensure_security_group() {
     echo "$sg_id"
 }
 
+# ── Ensure IAM instance profile with S3 access ──────────────────────────────
+
+ensure_instance_profile() {
+    local profile_arn
+    profile_arn=$(aws iam get-instance-profile \
+        --instance-profile-name "$INSTANCE_PROFILE_NAME" \
+        --query 'InstanceProfile.Arn' \
+        --output text 2>/dev/null) || true
+
+    if [[ -n "$profile_arn" && "$profile_arn" != "None" ]]; then
+        return 0
+    fi
+
+    log "Creating IAM role '${IAM_ROLE_NAME}' with S3 access..."
+
+    local trust_policy
+    trust_policy=$(cat <<'TRUST'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Service": "ec2.amazonaws.com"},
+    "Action": "sts:AssumeRole"
+  }]
+}
+TRUST
+)
+
+    aws iam create-role \
+        --role-name "$IAM_ROLE_NAME" \
+        --assume-role-policy-document "$trust_policy" \
+        --output text > /dev/null 2>&1 || true
+
+    local s3_policy
+    s3_policy=$(cat <<'S3POL'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["s3:GetObject","s3:PutObject","s3:ListBucket","s3:DeleteObject"],
+    "Resource": ["arn:aws:s3:::lpf-models-*","arn:aws:s3:::lpf-models-*/*"]
+  }]
+}
+S3POL
+)
+
+    aws iam put-role-policy \
+        --role-name "$IAM_ROLE_NAME" \
+        --policy-name "lpf-s3-models-access" \
+        --policy-document "$s3_policy"
+
+    log "Creating instance profile '${INSTANCE_PROFILE_NAME}'..."
+    aws iam create-instance-profile \
+        --instance-profile-name "$INSTANCE_PROFILE_NAME" \
+        --output text > /dev/null 2>&1 || true
+
+    aws iam add-role-to-instance-profile \
+        --instance-profile-name "$INSTANCE_PROFILE_NAME" \
+        --role-name "$IAM_ROLE_NAME" 2>/dev/null || true
+
+    # Instance profiles need a few seconds to propagate
+    log "Waiting for instance profile to propagate..."
+    sleep 10
+
+    log "IAM instance profile ready."
+}
+
 # ── Find the best GPU AMI ───────────────────────────────────────────────────
 
 find_gpu_ami() {
@@ -255,8 +325,12 @@ download_models() {
     local ip="$1"
 
     if [[ -n "$MODELS_S3_URI" ]]; then
-        log "Downloading model files from S3: ${MODELS_S3_URI}..."
-        remote_exec "$ip" "sudo mkdir -p ~/models && sudo chown -R ubuntu:ubuntu ~/models && aws s3 sync ${MODELS_S3_URI} ~/models"
+        log "Syncing model files from S3: ${MODELS_S3_URI}..."
+        local sync_start
+        sync_start=$(date +%s)
+        remote_exec "$ip" "sudo mkdir -p ~/models && sudo chown -R ubuntu:ubuntu ~/models && aws s3 sync '${MODELS_S3_URI}' ~/models --only-show-errors"
+        local sync_elapsed=$(( $(date +%s) - sync_start ))
+        log "S3 sync complete in ${sync_elapsed}s."
         return 0
     fi
 
@@ -356,6 +430,9 @@ cmd_up() {
     ensure_key_pair
     local sg_id ami_id instance_id
     sg_id=$(ensure_security_group)
+    if [[ -n "$MODELS_S3_URI" ]]; then
+        ensure_instance_profile
+    fi
     ami_id=$(find_gpu_ami)
     log "Using AMI: ${ami_id}"
     log "Instance type: ${INSTANCE_TYPE}"
@@ -371,6 +448,10 @@ cmd_up() {
         --query 'Instances[0].InstanceId'
         --output text
     )
+
+    if [[ -n "$MODELS_S3_URI" ]]; then
+        run_args+=(--iam-instance-profile "Name=${INSTANCE_PROFILE_NAME}")
+    fi
 
     if [[ "$USE_SPOT" == "true" ]]; then
         log "Requesting spot instance (max price: \$${SPOT_MAX_PRICE}/hr)..."
@@ -550,6 +631,38 @@ cmd_logs() {
     remote_exec "$ip" "docker logs -f lpf-worker"
 }
 
+# ── Cache models to S3 ───────────────────────────────────────────────────────
+
+cmd_cache_models() {
+    [[ -z "$MODELS_S3_URI" ]] && die "MODELS_S3_URI is not set. Set it in infra/worker.conf (e.g. s3://lpf-models-cache/models)."
+
+    local ip
+    ip=$(get_public_ip)
+    [[ -z "$ip" ]] && die "No running instance found. Deploy first with './deploy-worker.sh up'."
+
+    local bucket
+    bucket=$(echo "$MODELS_S3_URI" | sed 's|s3://||' | cut -d/ -f1)
+
+    log "Ensuring S3 bucket '${bucket}' exists..."
+    aws s3 mb "s3://${bucket}" --region "$AWS_REGION" 2>/dev/null || true
+
+    ensure_instance_profile
+
+    log "Uploading ~/models to ${MODELS_S3_URI}..."
+    local start_time
+    start_time=$(date +%s)
+
+    remote_exec "$ip" "aws s3 sync ~/models '${MODELS_S3_URI}' --only-show-errors"
+
+    local elapsed=$(( $(date +%s) - start_time ))
+    log "Upload complete in ${elapsed}s."
+
+    local size
+    size=$(remote_exec "$ip" "du -sh ~/models 2>/dev/null | cut -f1")
+    log "Cached ${size} to ${MODELS_S3_URI}"
+    log "Future deploys with MODELS_S3_URI set will sync from S3 instead of Hugging Face."
+}
+
 # ── Init config ──────────────────────────────────────────────────────────────
 
 cmd_init() {
@@ -587,10 +700,10 @@ SG_NAME=lpf-worker-sg
 USE_SPOT=false
 SPOT_MAX_PRICE=0.50
 
-# S3 URI for pre-cached model files (optional, speeds up cold start)
-# If set, models are downloaded from S3 instead of Hugging Face.
-# Example: s3://my-bucket/lpf-models
-MODELS_S3_URI=
+# S3 URI for pre-cached model files (speeds up cold start).
+# Models are synced from S3 instead of Hugging Face when set.
+# Upload once with: ./deploy-worker.sh cache-models
+MODELS_S3_URI=s3://lpf-models-cache/models
 
 # Hugging Face token for downloading models (required for Gemma-3)
 # Prefer setting HUGGING_FACE_API_KEY in .env; this overrides if set
@@ -614,15 +727,16 @@ usage() {
 Usage: ./deploy-worker.sh <command>
 
 Commands:
-  init      Create default config at infra/worker.conf
-  up        Launch a GPU instance, build Docker image, start worker
-  down      Terminate the instance (destroys everything)
-  stop      Stop the instance (preserves disk, no GPU charges)
-  start     Start a previously stopped instance
-  build     Rebuild Docker image and restart worker on running instance
-  status    Show instance info (ID, state, IP)
-  ssh       SSH into the instance
-  logs      Tail worker container logs
+  init          Create default config at infra/worker.conf
+  up            Launch a GPU instance, build Docker image, start worker
+  down          Terminate the instance (destroys everything)
+  stop          Stop the instance (preserves disk, no GPU charges)
+  start         Start a previously stopped instance
+  build         Rebuild Docker image and restart worker on running instance
+  cache-models  Upload ~/models from running instance to S3 (one-time)
+  status        Show instance info (ID, state, IP)
+  ssh           SSH into the instance
+  logs          Tail worker container logs
 
 EOF
 }
@@ -630,14 +744,15 @@ EOF
 ACTION="${1:-help}"
 
 case "$ACTION" in
-    init)   cmd_init ;;
-    up)     cmd_up ;;
-    down)   cmd_down ;;
-    stop)   cmd_stop ;;
-    start)  cmd_start ;;
-    build)  cmd_build ;;
-    status) cmd_status ;;
-    ssh)    cmd_ssh ;;
-    logs)   cmd_logs ;;
-    *)      usage ;;
+    init)          cmd_init ;;
+    up)            cmd_up ;;
+    down)          cmd_down ;;
+    stop)          cmd_stop ;;
+    start)         cmd_start ;;
+    build)         cmd_build ;;
+    cache-models)  cmd_cache_models ;;
+    status)        cmd_status ;;
+    ssh)           cmd_ssh ;;
+    logs)          cmd_logs ;;
+    *)             usage ;;
 esac
