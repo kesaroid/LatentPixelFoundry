@@ -324,18 +324,24 @@ GEMMA_REPO="google/gemma-3-1b-it"
 download_models() {
     local ip="$1"
 
+    remote_exec "$ip" "sudo mkdir -p ~/models && sudo chown -R ubuntu:ubuntu ~/models"
+
     if [[ -n "$MODELS_S3_URI" ]]; then
         log "Syncing model files from S3: ${MODELS_S3_URI}..."
         local sync_start
         sync_start=$(date +%s)
-        remote_exec "$ip" "sudo mkdir -p ~/models && sudo chown -R ubuntu:ubuntu ~/models && aws s3 sync '${MODELS_S3_URI}' ~/models --only-show-errors"
+        remote_exec "$ip" "aws s3 sync '${MODELS_S3_URI}' ~/models --only-show-errors"
         local sync_elapsed=$(( $(date +%s) - sync_start ))
         log "S3 sync complete in ${sync_elapsed}s."
-        return 0
+
+        if remote_exec "$ip" "test -f ~/models/ltx2/model_index.json"; then
+            log "LTX-2 models present after S3 sync (ltx2/model_index.json)."
+            return 0
+        fi
+        log "S3 cache empty or incomplete (missing ~/models/ltx2/model_index.json). Falling back to Hugging Face download..."
     fi
 
     # Option A (README_RUNTIME): run scripts/download_all_models.sh on instance if present
-    remote_exec "$ip" "sudo mkdir -p ~/models && sudo chown -R ubuntu:ubuntu ~/models"
     if remote_exec "$ip" "
         if [ -f ~/project/worker/scripts/download_all_models.sh ]; then
             chmod +x ~/project/worker/scripts/*.sh 2>/dev/null || true
