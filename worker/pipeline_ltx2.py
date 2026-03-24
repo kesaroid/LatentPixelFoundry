@@ -69,7 +69,7 @@ def run(
         torch_dtype=torch.bfloat16,
         local_files_only=True,
     )
-    pipe = pipe.to(device)
+    pipe.enable_sequential_cpu_offload(device=device)
 
     # Stage 1
     video_latent, audio_latent = pipe(
@@ -94,7 +94,7 @@ def run(
         local_files_only=True,
     )
     upsample_pipe = LTX2LatentUpsamplePipeline(vae=pipe.vae, latent_upsampler=latent_upsampler)
-    upsample_pipe = upsample_pipe.to(device)
+    upsample_pipe.enable_model_cpu_offload(device=device)
     upscaled_video_latent = upsample_pipe(
         latents=video_latent,
         output_type="latent",
