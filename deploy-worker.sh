@@ -12,6 +12,7 @@
 #   ./deploy-worker.sh ssh       SSH into the instance
 #   ./deploy-worker.sh build     Rebuild and restart the worker container
 #   ./deploy-worker.sh logs      Tail worker container logs
+#   ./deploy-worker.sh uncache   Delete the S3 model cache bucket
 #
 # Prerequisites:
 #   - AWS CLI v2 configured (aws configure)
@@ -280,10 +281,6 @@ S3POL
         --instance-profile-name "$INSTANCE_PROFILE_NAME" \
         --role-name "$IAM_ROLE_NAME" 2>/dev/null || true
 
-    # Instance profiles need a few seconds to propagate
-    log "Waiting for instance profile to propagate..."
-    sleep 10
-
     log "IAM instance profile ready."
 }
 
@@ -321,12 +318,33 @@ LTX2_FILES=(
 
 GEMMA_REPO="google/gemma-3-1b-it"
 
+# Create bucket from MODELS_S3_URI on the deploy machine (instance role has no CreateBucket).
+ensure_models_s3_bucket() {
+    [[ -z "$MODELS_S3_URI" ]] && return 0
+    local bucket
+    bucket=$(echo "$MODELS_S3_URI" | sed 's|s3://||' | cut -d/ -f1)
+    [[ -z "$bucket" ]] && die "Invalid MODELS_S3_URI (missing bucket): ${MODELS_S3_URI}"
+    log "Ensuring S3 bucket '${bucket}' exists (region ${AWS_REGION})..."
+    if aws s3api head-bucket --bucket "$bucket" --region "$AWS_REGION" 2>/dev/null; then
+        log "  Bucket already exists."
+        return 0
+    fi
+    if ! aws s3 mb "s3://${bucket}" --region "$AWS_REGION"; then
+        die "Could not create bucket s3://${bucket}. Grant s3:CreateBucket to your deploy IAM user, or create the bucket manually in ${AWS_REGION}."
+    fi
+    if ! aws s3api head-bucket --bucket "$bucket" --region "$AWS_REGION"; then
+        die "Bucket s3://${bucket} still not reachable after create. Check region and IAM permissions."
+    fi
+    log "  Bucket created and verified."
+}
+
 download_models() {
     local ip="$1"
 
     remote_exec "$ip" "sudo mkdir -p ~/models && sudo chown -R ubuntu:ubuntu ~/models"
 
     if [[ -n "$MODELS_S3_URI" ]]; then
+        ensure_models_s3_bucket
         log "Syncing model files from S3: ${MODELS_S3_URI}..."
         local sync_start
         sync_start=$(date +%s)
@@ -436,9 +454,6 @@ cmd_up() {
     ensure_key_pair
     local sg_id ami_id instance_id
     sg_id=$(ensure_security_group)
-    if [[ -n "$MODELS_S3_URI" ]]; then
-        ensure_instance_profile
-    fi
     ami_id=$(find_gpu_ami)
     log "Using AMI: ${ami_id}"
     log "Instance type: ${INSTANCE_TYPE}"
@@ -454,10 +469,6 @@ cmd_up() {
         --query 'Instances[0].InstanceId'
         --output text
     )
-
-    if [[ -n "$MODELS_S3_URI" ]]; then
-        run_args+=(--iam-instance-profile "Name=${INSTANCE_PROFILE_NAME}")
-    fi
 
     if [[ "$USE_SPOT" == "true" ]]; then
         log "Requesting spot instance (max price: \$${SPOT_MAX_PRICE}/hr)..."
@@ -475,6 +486,15 @@ cmd_up() {
     log "Public IP: ${ip}"
 
     wait_for_ssh "$ip"
+
+    if [[ -n "$MODELS_S3_URI" ]]; then
+        ensure_instance_profile
+        log "Associating IAM instance profile with instance..."
+        aws ec2 associate-iam-instance-profile \
+            --region "$AWS_REGION" \
+            --instance-id "$instance_id" \
+            --iam-instance-profile "Name=${INSTANCE_PROFILE_NAME}"
+    fi
 
     sync_project "$ip" up
 
@@ -646,11 +666,7 @@ cmd_cache_models() {
     ip=$(get_public_ip)
     [[ -z "$ip" ]] && die "No running instance found. Deploy first with './deploy-worker.sh up'."
 
-    local bucket
-    bucket=$(echo "$MODELS_S3_URI" | sed 's|s3://||' | cut -d/ -f1)
-
-    log "Ensuring S3 bucket '${bucket}' exists..."
-    aws s3 mb "s3://${bucket}" --region "$AWS_REGION" 2>/dev/null || true
+    ensure_models_s3_bucket
 
     ensure_instance_profile
 
@@ -667,6 +683,25 @@ cmd_cache_models() {
     size=$(remote_exec "$ip" "du -sh ~/models 2>/dev/null | cut -f1")
     log "Cached ${size} to ${MODELS_S3_URI}"
     log "Future deploys with MODELS_S3_URI set will sync from S3 instead of Hugging Face."
+}
+
+cmd_uncache() {
+    [[ -z "$MODELS_S3_URI" ]] && die "MODELS_S3_URI is not set. Set it in infra/worker.conf."
+
+    local bucket
+    bucket=$(echo "$MODELS_S3_URI" | sed 's|s3://||' | cut -d/ -f1)
+    [[ -z "$bucket" ]] && die "Invalid MODELS_S3_URI (missing bucket): ${MODELS_S3_URI}"
+
+    if ! aws s3api head-bucket --bucket "$bucket" --region "$AWS_REGION" 2>/dev/null; then
+        log "Bucket s3://${bucket} does not exist. Nothing to do."
+        return 0
+    fi
+
+    log "Deleting S3 bucket s3://${bucket} and all contents..."
+    if ! aws s3 rb "s3://${bucket}" --force --region "$AWS_REGION"; then
+        die "Failed to delete bucket s3://${bucket}. Ensure you have s3:DeleteBucket and s3:DeleteObject permissions."
+    fi
+    log "Bucket s3://${bucket} deleted. Future deploys will download models from Hugging Face."
 }
 
 # ── Init config ──────────────────────────────────────────────────────────────
@@ -740,6 +775,7 @@ Commands:
   start         Start a previously stopped instance
   build         Rebuild Docker image and restart worker on running instance
   cache-models  Upload ~/models from running instance to S3 (one-time)
+  uncache       Delete the S3 model cache bucket (future deploys download fresh)
   status        Show instance info (ID, state, IP)
   ssh           SSH into the instance
   logs          Tail worker container logs
@@ -757,6 +793,7 @@ case "$ACTION" in
     start)         cmd_start ;;
     build)         cmd_build ;;
     cache-models)  cmd_cache_models ;;
+    uncache)       cmd_uncache ;;
     status)        cmd_status ;;
     ssh)           cmd_ssh ;;
     logs)          cmd_logs ;;
