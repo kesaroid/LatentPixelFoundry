@@ -12,7 +12,7 @@
 #   ./deploy-worker.sh ssh       SSH into the instance
 #   ./deploy-worker.sh build     Rebuild and restart the worker container
 #   ./deploy-worker.sh logs      Tail worker container logs
-#   ./deploy-worker.sh uncache   Delete the S3 model cache bucket
+#   ./deploy-worker.sh uncache [--delete-bucket]  Clear S3 cache prefix; optional full bucket delete
 #
 # Prerequisites:
 #   - AWS CLI v2 configured (aws configure)
@@ -686,22 +686,45 @@ cmd_cache_models() {
 }
 
 cmd_uncache() {
+    local opt="${1:-}"
     [[ -z "$MODELS_S3_URI" ]] && die "MODELS_S3_URI is not set. Set it in infra/worker.conf."
 
-    local bucket
-    bucket=$(echo "$MODELS_S3_URI" | sed 's|s3://||' | cut -d/ -f1)
-    [[ -z "$bucket" ]] && die "Invalid MODELS_S3_URI (missing bucket): ${MODELS_S3_URI}"
+    if [[ -n "$opt" && "$opt" != "--delete-bucket" ]]; then
+        die "Unknown option '${opt}'. Usage: ./deploy-worker.sh uncache [--delete-bucket]"
+    fi
 
-    if ! aws s3api head-bucket --bucket "$bucket" --region "$AWS_REGION" 2>/dev/null; then
-        log "Bucket s3://${bucket} does not exist. Nothing to do."
+    local rest bucket prefix rm_target
+    rest="${MODELS_S3_URI#s3://}"
+    bucket="${rest%%/*}"
+    [[ -z "$bucket" ]] && die "Invalid MODELS_S3_URI (missing bucket): ${MODELS_S3_URI}"
+    if [[ "$rest" == "$bucket" ]]; then
+        prefix=""
+    else
+        prefix="${rest#"${bucket}"/}"
+    fi
+    prefix="${prefix%/}"
+
+    if [[ "$opt" == "--delete-bucket" ]]; then
+        log "Deleting entire S3 bucket s3://${bucket} (all prefixes)..."
+        if ! aws s3 rb "s3://${bucket}" --force --region "$AWS_REGION"; then
+            die "Failed to delete bucket s3://${bucket}. Ensure s3:DeleteBucket, s3:DeleteObject, and s3:ListBucket."
+        fi
+        log "Bucket s3://${bucket} deleted."
         return 0
     fi
 
-    log "Deleting S3 bucket s3://${bucket} and all contents..."
-    if ! aws s3 rb "s3://${bucket}" --force --region "$AWS_REGION"; then
-        die "Failed to delete bucket s3://${bucket}. Ensure you have s3:DeleteBucket and s3:DeleteObject permissions."
+    if [[ -n "$prefix" ]]; then
+        rm_target="s3://${bucket}/${prefix}"
+        log "Removing cached objects under ${rm_target}/ (bucket kept)..."
+    else
+        rm_target="s3://${bucket}"
+        log "Removing all objects in ${rm_target}/ (bucket kept; MODELS_S3_URI has no path prefix)..."
     fi
-    log "Bucket s3://${bucket} deleted. Future deploys will download models from Hugging Face."
+
+    if ! aws s3 rm "${rm_target}/" --recursive --region "$AWS_REGION"; then
+        die "Failed to remove objects under ${rm_target}/. Check IAM (s3:DeleteObject, s3:ListBucket)."
+    fi
+    log "S3 cache cleared. Next deploy with MODELS_S3_URI set will sync an empty prefix and fall back to Hugging Face until you run cache-models again."
 }
 
 # ── Init config ──────────────────────────────────────────────────────────────
@@ -775,7 +798,8 @@ Commands:
   start         Start a previously stopped instance
   build         Rebuild Docker image and restart worker on running instance
   cache-models  Upload ~/models from running instance to S3 (one-time)
-  uncache       Delete the S3 model cache bucket (future deploys download fresh)
+  uncache       Clear objects under MODELS_S3_URI prefix (bucket kept)
+  uncache --delete-bucket  Delete the entire S3 bucket and all contents
   status        Show instance info (ID, state, IP)
   ssh           SSH into the instance
   logs          Tail worker container logs
@@ -793,7 +817,7 @@ case "$ACTION" in
     start)         cmd_start ;;
     build)         cmd_build ;;
     cache-models)  cmd_cache_models ;;
-    uncache)       cmd_uncache ;;
+    uncache)       cmd_uncache "${2:-}" ;;
     status)        cmd_status ;;
     ssh)           cmd_ssh ;;
     logs)          cmd_logs ;;
