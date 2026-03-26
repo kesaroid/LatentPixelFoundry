@@ -101,6 +101,21 @@ def run(
         return_dict=False,
     )[0]
 
+    # Stage handoff: make sure GPU is actually freed before stage 2.
+    # `enable_*_cpu_offload` primarily manages *model weights*, but stage 1/2 reuse
+    # shared modules (notably `pipe.vae`) and can leave the last-used components
+    # resident on GPU. That leaves Accelerate with essentially no free VRAM when
+    # it tries to move `text_encoder` for `encode_prompt` in stage 2.
+    if torch.cuda.is_available() and device.startswith("cuda"):
+        del upsample_pipe, latent_upsampler
+        # `video_latent` is no longer needed after upsampling.
+        del video_latent
+        torch.cuda.empty_cache()
+        # Force all diffusion modules back to CPU, then re-enable sequential
+        # offload so the next stage starts from a clean memory baseline.
+        pipe.to("cpu")
+        pipe.enable_sequential_cpu_offload(device=device)
+
     # Stage 2 distilled LoRA
     pipe.load_lora_weights(
         LTX2_LOCAL_PATH,

@@ -1,0 +1,8 @@
+# ComfyUI extra model paths — reuse models downloaded by download_all_models.sh
+# Mounted into the container at /models (host ~/models).
+ltx2:
+    base_path: /models/ltx2
+    checkpoints: ./
+    loras: ./
+    vae: vae/
+    diffusers: /models

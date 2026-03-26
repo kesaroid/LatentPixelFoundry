@@ -211,12 +211,18 @@ ensure_security_group() {
         aws ec2 authorize-security-group-ingress \
             --region "$AWS_REGION" --group-id "$sg_id" \
             --protocol tcp --port 9000 --cidr 0.0.0.0/0
+        aws ec2 authorize-security-group-ingress \
+            --region "$AWS_REGION" --group-id "$sg_id" \
+            --protocol tcp --port 8188 --cidr 0.0.0.0/0
         log "Security group created: ${sg_id}"
     else
-        # Ensure port 9000 is allowed (idempotent; duplicate rule is ignored)
+        # Ensure ports 9000 and 8188 are allowed (idempotent; duplicate rule is ignored)
         aws ec2 authorize-security-group-ingress \
             --region "$AWS_REGION" --group-id "$sg_id" \
             --protocol tcp --port 9000 --cidr 0.0.0.0/0 2>/dev/null || true
+        aws ec2 authorize-security-group-ingress \
+            --region "$AWS_REGION" --group-id "$sg_id" \
+            --protocol tcp --port 8188 --cidr 0.0.0.0/0 2>/dev/null || true
     fi
     echo "$sg_id"
 }
@@ -556,6 +562,7 @@ _start_container() {
             --gpus all \
             --restart unless-stopped \
             -p 9000:9000 \
+            -p 8188:8188 \
             -v /home/ubuntu/models:/models \
             $env_flags \
             -e CHECKPOINT_FILENAME='"${CHECKPOINT_FILENAME}"' \
